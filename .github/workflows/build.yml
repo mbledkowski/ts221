@@ -16,12 +16,15 @@ jobs:
       due: ${{ steps.cadence.outputs.due }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/rattler
+          key: pixi-rattler-${{ runner.os }}-${{ runner.arch }}-check-${{ hashFiles('pixi.lock') }}
       - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
         with:
           pixi-version: v0.79.0
-          run-install: false
-          cache: true
-      - run: pixi install --locked --environment check
+          environments: check
+          cache: false # disable built in cache
       - run: pixi run --locked --environment check test
       - run: pixi run --locked --environment check lint
       - id: cadence
@@ -43,17 +46,19 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/rattler
+          key: pixi-rattler-${{ runner.os }}-${{ runner.arch }}-default-${{ hashFiles('pixi.lock') }}
       - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
         with:
           pixi-version: v0.79.0
-          run-install: false
-          cache: true
+          cache: false
       - name: Build candidates
         env:
           PUBLIC_KEY: ${{ vars.RELEASE_PUBKEY }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          pixi install --locked
           FIRMWARE_TEST_SPACED_ROOT=1 pixi run --locked \
             python3 -m unittest discover -s tests -p 'test_build.py' -v
           pixi run --locked prepare

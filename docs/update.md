@@ -35,7 +35,7 @@ Choose your starting point:
 
 - **Signing boundary:** RAM-only recovery tests do not require signing. Permanent
   installation and automatic updates require a signed manifest verified against
-  the embedded trust anchor.
+  the embedded trust anchor. GitHub draft creation and public publication are optional.
 - **Daily schedule:** The installed firmware checks its configured GitHub repository
   daily. Before installing, it verifies the Ed25519 digital signature, board model,
   manifest format, release sequence, file sizes, and SHA-256 hashes.
@@ -129,6 +129,8 @@ later requires rebuilding and requalifying every image that embeds the public ke
 
 A candidate is the exact set of files you will test, sign, and install. Keep
 that set unchanged between hardware testing, signing, and publication.
+
+A public release requires a clean committed source revision before the build.
 
 - **Public release:** Review and commit intended source changes first. The build
   block below requires a clean Git working tree (`test -z "$(git status --porcelain)"`)

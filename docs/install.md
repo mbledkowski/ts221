@@ -764,6 +764,13 @@ test "$PWD" = "$REPO" && printf 'Back on build host in %s\n' "$REPO"
 **Continue only if you intend to install permanently.** Use only backed-up or
 disposable disks. Step 9 replaces partition tables on `/dev/sda` and `/dev/sdb`.
 
+Signing the exact qualified files for a local installation does not require a clean Git worktree, a new commit,
+a push, a GitHub login, or a GitHub release.
+If the build tree was dirty, `project_commit` records only its base commit; the
+resulting bundle must not be presented as a reproducible public release. Public
+publication requires rebuilding and qualifying from a clean committed tree as
+described in [the release guide](update.md#publication-candidate).
+
 Leave the NAS running in RAM recovery. In **terminal H**, verify release inputs:
 
 **Execution context:** [Host - Terminal H]
