@@ -1,0 +1,2 @@
+# Keep Conda prefixes free of whitespace even when the checkout path contains it.
+detached-environments = true
