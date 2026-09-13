@@ -1,0 +1,70 @@
+name: Build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-slim
+    outputs:
+      due: ${{ steps.cadence.outputs.due }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.79.0
+          run-install: false
+          cache: true
+      - run: pixi install --locked --environment check
+      - run: pixi run --locked --environment check test
+      - run: pixi run --locked --environment check lint
+      - id: cadence
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          days=$(( ($(date -u +%s) - $(date -u -d 2026-09-07 +%s)) / 86400 ))
+          if [[ "$EVENT" == workflow_dispatch ]] ||
+             [[ "$EVENT" == schedule && "$days" -ge 0 && $((days % 14)) -eq 0 ]]; then
+            echo due=true >> "$GITHUB_OUTPUT"
+          fi
+  build:
+    needs: check
+    if: needs.check.outputs.due == 'true'
+    runs-on: [self-hosted, linux, firmware]
+    timeout-minutes: 360
+    concurrency:
+      group: firmware-build
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.79.0
+          run-install: false
+          cache: true
+      - name: Build candidates
+        env:
+          PUBLIC_KEY: ${{ vars.RELEASE_PUBKEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          pixi install --locked
+          FIRMWARE_TEST_SPACED_ROOT=1 pixi run --locked \
+            python3 -m unittest discover -s tests -p 'test_build.py' -v
+          pixi run --locked prepare
+          mkdir -p work
+          printf '%s\n' "$PUBLIC_KEY" > work/release.pub
+          export RELEASE_PUBKEY="$PWD/work/release.pub"
+          pixi run --locked openssl pkey -pubin -in "$RELEASE_PUBKEY" -text -noout | grep -q ED25519
+          pixi run --locked resolve
+          pixi run --locked build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: firmware-${{ github.run_id }}
+          path: dist/
+          if-no-files-found: error

@@ -1,0 +1,36 @@
+From 2cf91b179f97cf85b62ea4ec2ef7ac732dac926b Mon Sep 17 00:00:00 2001
+Date: Thu, 3 Sep 2026 22:00:29 +0200
+Subject: [PATCH 1/2] dt-bindings: arm: marvell: add QNAP TS-221 and Fujitsu
+ Q703
+
+Add the QNAP TS-221 and the Fujitsu CELVIN Q703 (88F6282) to the
+kirkwood board bindings.  The Q703 follows the QNAP TS-2xx design.
+
+---
+ .../devicetree/bindings/arm/marvell/marvell,kirkwood.yaml       | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/arm/marvell/marvell,kirkwood.yaml b/Documentation/devicetree/bindings/arm/marvell/marvell,kirkwood.yaml
+index 120784066833..bbb6ee694b7d 100644
+--- a/Documentation/devicetree/bindings/arm/marvell/marvell,kirkwood.yaml
++++ b/Documentation/devicetree/bindings/arm/marvell/marvell,kirkwood.yaml
+@@ -216,8 +216,10 @@ properties:
+               - buffalo,lsqvl
+               - buffalo,lsvl
+               - buffalo,lswvl
++              - fujitsu,q703
+               - linksys,viper
+               - marvell,db-88f6282-bp
++              - qnap,ts221
+               - zyxel,nsa325
+           - const: marvell,kirkwood-88f6282
+           - const: marvell,kirkwood
+diff --git a/arch/arm/boot/dts/marvell/Makefile b/arch/arm/boot/dts/marvell/Makefile
+--- a/arch/arm/boot/dts/marvell/Makefile
++++ b/arch/arm/boot/dts/marvell/Makefile
+@@ -1,3 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
++dtb-$(CONFIG_MACH_KIRKWOOD) += kirkwood-q703.dtb kirkwood-ts221.dtb
++
+ dtb-$(CONFIG_ARCH_MMP) += \
+ 	pxa168-aspenite.dtb \

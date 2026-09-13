@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0
+// Hardware qualification pending.
+/dts-v1/;
+
+#include "ts221-common.dtsi"
+
+/ {
+	model = "QNAP TS-221";
+	compatible = "qnap,ts221", "marvell,kirkwood-88f6282",
+		     "marvell,kirkwood";
+};

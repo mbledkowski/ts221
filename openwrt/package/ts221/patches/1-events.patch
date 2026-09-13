@@ -1,0 +1,70 @@
+Subject: [PATCH] ts219: dispatch every PIC byte in the read window
+
+The Q703 PIC streams a temperature byte every few seconds, and an
+unsolicited event (power button, fan status, link/eSATA) can land
+anywhere in the same read() window.  Stock qcontrol only dispatches on
+buf[0], so an event byte that arrives after a temperature byte is
+silently dropped.  Walk the whole read buffer and dispatch each byte.
+
+---
+--- a/ts219.c
++++ b/ts219.c
+@@ -28,13 +28,9 @@
+ #include "picmodule.h"
+ #include "qnap-pic.h"
+ 
+-static int ts219_read_serial_events(void)
++static void ts219_dispatch_byte(unsigned char byte)
+ {
+-	unsigned char buf[100];
+-	int err = qnap_serial_read(buf, 100);
+-	if (err < 0)
+-		return err;
+-	switch (buf[0]) {
++	switch (byte) {
+ 	case QNAP_PICSTS_POWER_BUTTON:
+ 		call_function("power_button", "%d", 3);
+ 		break;
+@@ -45,16 +41,16 @@
+ 	case QNAP_PICSTS_FAN2_ERROR:
+ 	case QNAP_PICSTS_FAN3_ERROR:
+ 	case QNAP_PICSTS_FAN4_ERROR:
+-		call_function("fan_error", "%d", (QNAP_PICSTS_FAN4_ERROR - buf[0]) / 2 + 1);
++		call_function("fan_error", "%d", (QNAP_PICSTS_FAN4_ERROR - byte) / 2 + 1);
+ 		break;
+ 	case QNAP_PICSTS_FAN1_NORMAL:
+ 	case QNAP_PICSTS_FAN2_NORMAL:
+ 	case QNAP_PICSTS_FAN3_NORMAL:
+ 	case QNAP_PICSTS_FAN4_NORMAL:
+-		call_function("fan_normal", "%d", (QNAP_PICSTS_FAN4_NORMAL - buf[0]) / 2 + 1);
++		call_function("fan_normal", "%d", (QNAP_PICSTS_FAN4_NORMAL - byte) / 2 + 1);
+ 		break;
+ 	case QNAP_PICSTS_SYS_TEMP_0 ... QNAP_PICSTS_SYS_TEMP_70:
+-		call_function("temp", "%d", buf[0] - QNAP_PICSTS_SYS_TEMP_0);
++		call_function("temp", "%d", byte - QNAP_PICSTS_SYS_TEMP_0);
+ 		break;
+ 	case QNAP_PICSTS_SYS_TEMP_71_79:
+ 		call_function("temp", "%d", 75);
+@@ -76,8 +72,21 @@
+ 		break;
+ 	default:
+ 		print_log(LOG_WARNING, "(PIC 0x%x) unknown command from PIC",
+-			  buf[0]);
++			  byte);
+ 	}
++}
++
++static int ts219_read_serial_events(void)
++{
++	unsigned char buf[100];
++	int err = qnap_serial_read(buf, 100);
++	if (err < 0)
++		return err;
++	/* The Q703 PIC streams a temperature byte every few seconds; an
++	 * unsolicited event (power button, fan status, link/eSATA) can land
++	 * anywhere in the same read window, so dispatch every byte. */
++	for (int i = 0; i < err; i++)
++		ts219_dispatch_byte(buf[i]);
+ 
+ 	return -1;
+ }

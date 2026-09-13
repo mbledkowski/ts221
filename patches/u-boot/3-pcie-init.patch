@@ -1,0 +1,153 @@
+From 829361fb2944bc5aa836d39b27c7b38c62f3d3f7 Mon Sep 17 00:00:00 2001
+Date: Mon, 31 Aug 2026 20:35:52 +0200
+Subject: [PATCH 5/6] pci: kirkwood: restore 88F6282 PCIe initialization
+
+Restore the CPU-access, shared-pad, and per-port PHY register 0x92
+sequence executed by Marvell U-Boot 3.5.3 on 88F6282. Run it after
+the port clock is enabled and preserve the vendor 500 ms link window.
+
+diff --git a/arch/arm/mach-kirkwood/Makefile b/arch/arm/mach-kirkwood/Makefile
+index 0fb5a2326f..72df08be4e 100644
+--- a/arch/arm/mach-kirkwood/Makefile
++++ b/arch/arm/mach-kirkwood/Makefile
+@@ -8,6 +8,7 @@ obj-y	= cpu.o
+ obj-y	+= cache.o
+ obj-y	+= lowlevel.o
+ obj-y	+= mpp.o
++obj-$(CONFIG_PCI_MVEBU) += pcie.o
+ 
+ # cpu.o and cache.o contain CP15 instructions which cannot be run in
+ # Thumb state, so build them for ARM state even with CONFIG_SYS_THUMB_BUILD
+diff --git a/arch/arm/mach-kirkwood/include/mach/cpu.h b/arch/arm/mach-kirkwood/include/mach/cpu.h
+index dce190ddee..4cdbcae5a7 100644
+--- a/arch/arm/mach-kirkwood/include/mach/cpu.h
++++ b/arch/arm/mach-kirkwood/include/mach/cpu.h
+@@ -159,5 +159,7 @@ int kw_config_mpp(unsigned int mpp0_7, unsigned int mpp8_15,
+ 		unsigned int mpp32_39, unsigned int mpp40_47,
+ 		unsigned int mpp48_55);
+ unsigned int kw_winctrl_calcsize(unsigned int sizeval);
++int kirkwood_pcie_init(unsigned int port, void __iomem *base,
++		       unsigned int *link_wait_retriesp);
+ #endif /* __ASSEMBLY__ */
+ #endif /* _KWCPU_H */
+diff --git a/arch/arm/mach-kirkwood/pcie.c b/arch/arm/mach-kirkwood/pcie.c
+new file mode 100644
+index 0000000000..dda249ccd0
+--- /dev/null
++++ b/arch/arm/mach-kirkwood/pcie.c
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Marvell Kirkwood PCIe silicon initialization
++ */
++
++#include <asm/io.h>
++#include <asm/arch/cpu.h>
++#include <asm/arch/soc.h>
++#include <linux/bitops.h>
++#include <linux/errno.h>
++
++#define KIRKWOOD_DEVICE_ID_88F6282	0x6282
++#define KIRKWOOD_PCIE_PAD_CTRL		(KW_MPP_BASE + 0xe4)
++#define KIRKWOOD_PCIE_PHY_ACCESS	0x1b00
++#define KIRKWOOD_PCIE_PHY_READ		BIT(31)
++#define KIRKWOOD_PCIE_PHY_REG_SHIFT	16
++#define KIRKWOOD_PCIE_PHY_88F6282_REG	0x92
++#define KIRKWOOD_PCIE_PHY_88F6282_MASK	0x80f0
++#define KIRKWOOD_PCIE_PHY_88F6282_VALUE	0x8080
++#define KIRKWOOD_PCIE_LINK_RETRIES	500
++
++static u16 kirkwood_pcie_phy_read(void __iomem *base, u16 reg)
++{
++	writel(KIRKWOOD_PCIE_PHY_READ |
++	       ((u32)reg << KIRKWOOD_PCIE_PHY_REG_SHIFT),
++	       base + KIRKWOOD_PCIE_PHY_ACCESS);
++
++	return readl(base + KIRKWOOD_PCIE_PHY_ACCESS);
++}
++
++static void kirkwood_pcie_phy_write(void __iomem *base, u16 reg, u16 value)
++{
++	writel(((u32)reg << KIRKWOOD_PCIE_PHY_REG_SHIFT) | value,
++	       base + KIRKWOOD_PCIE_PHY_ACCESS);
++}
++
++int kirkwood_pcie_init(unsigned int port, void __iomem *base,
++		       unsigned int *link_wait_retriesp)
++{
++	struct kwcpu_registers *cpureg = (void *)KW_CPU_REG_BASE;
++	u16 device_id, value;
++
++	if (port > 1)
++		return -EINVAL;
++
++	setbits_le32(&cpureg->ctrl_stat, BIT(port * 4));
++
++	device_id = (readl(KW_REG_PCIE_DEVID) >> 16) & 0xffff;
++	if (device_id != KIRKWOOD_DEVICE_ID_88F6282)
++		return 0;
++
++	setbits_le32((void *)KIRKWOOD_PCIE_PAD_CTRL, BIT(25) | BIT(26));
++
++	value = kirkwood_pcie_phy_read(base, KIRKWOOD_PCIE_PHY_88F6282_REG);
++	value &= ~KIRKWOOD_PCIE_PHY_88F6282_MASK;
++	value |= KIRKWOOD_PCIE_PHY_88F6282_VALUE;
++	kirkwood_pcie_phy_write(base, KIRKWOOD_PCIE_PHY_88F6282_REG, value);
++
++	*link_wait_retriesp = KIRKWOOD_PCIE_LINK_RETRIES;
++
++	return 0;
++}
+diff --git a/drivers/pci/pci_mvebu.c b/drivers/pci/pci_mvebu.c
+--- a/drivers/pci/pci_mvebu.c
++++ b/drivers/pci/pci_mvebu.c
+@@ -67,6 +67,7 @@
+ 	u32 intregs;
+ 	u32 port;
+ 	u32 lane;
++	u32 link_wait_retries;
+ 	bool is_x4;
+ 	int devfn;
+ 	int sec_busno;
+@@ -109,7 +110,7 @@
+ 	int retries;
+ 
+ 	/* check if the link is up or not */
+-	for (retries = 0; retries < LINK_WAIT_RETRIES; retries++) {
++	for (retries = 0; retries < pcie->link_wait_retries; retries++) {
+ 		if (mvebu_pcie_link_up(pcie)) {
+ 			printf("%s: Link up\n", pcie->name);
+ 			return;
+@@ -667,6 +668,7 @@
+ 		pcie->lane = 0;
+ 
+ 	sprintf(pcie->name, "pcie%d.%d", pcie->port, pcie->lane);
++	pcie->link_wait_retries = LINK_WAIT_RETRIES;
+ 
+ 	if (!ofnode_read_u32(node, "num-lanes", &num_lanes) && num_lanes == 4)
+ 		pcie->is_x4 = true;
+@@ -818,7 +820,23 @@
+ 		ports_count++;
+ 	}
+ 
+-	/* Second phase: Setup all PCIe links (do not enable them yet). */
++	/*
++	 * Second phase: initialize the 88F6282 PCIe pad and PHY exactly as
++	 * the vendor boot ROM successor does (no-op on other Marvell SoCs).
++	 */
++#ifdef CONFIG_ARCH_KIRKWOOD
++	for (i = 0; i < ports_count; i++) {
++		pcie = ports_pcie[i];
++		if (pcie &&
++		    kirkwood_pcie_init(pcie->port, pcie->base,
++				       &pcie->link_wait_retries)) {
++			free(pcie);
++			ports_pcie[i] = NULL;
++		}
++	}
++#endif
++
++	/* Third phase: Setup all PCIe links (do not enable them yet). */
+ 	for (i = 0; i < ports_count; i++) {
+ 		if (!ports_pcie[i])
+ 			continue;

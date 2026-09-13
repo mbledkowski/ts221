@@ -1,0 +1,269 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# shellcheck shell=dash
+set -eu
+umask 077
+root=${FIRMWARE_ROOT:-}
+# shellcheck source=openwrt/files/usr/lib/firmware.sh
+. "$root/usr/lib/firmware.sh"
+
+die() { echo "firmware-install: $*" >&2; exit 1; }
+usage() {
+	echo 'usage: firmware-install status | confirm | upgrade STAGE' >&2
+	echo '       firmware-install init STAGE BACKUP_DIR --erase-system' >&2
+	echo '       firmware-install u-boot STAGE BACKUP_DIR --flash-nor' >&2
+	exit 2
+}
+mode=${1:-}; shift || usage
+# One-shot boot health check, launched alongside the board services.
+if [ "$mode:$#" = check:0 ]; then
+	awk '$2 == "/" { fs=$3 } END { exit fs != "ext4" }' "$root/proc/mounts" || exit 0
+	[ -f "$config/installed" ] || exit 0
+	sleep 60
+	while :; do
+		if "$0" confirm; then exit 0; else result=$?; fi
+		[ "$result" = 75 ] || break
+		sleep 10
+	done
+	logger -t firmware 'Boot confirmation failed; rebooting for rollback'
+	reboot
+	exit 1
+fi
+case "$mode:$#" in status:0|confirm:0|upgrade:1) ;; init:3|u-boot:3) ;; *) usage ;; esac
+identify_board
+mkdir -p "$root/var/lock" "$root/tmp"
+exec 8> "$root/var/lock/firmware-install.lock"
+flock -n 8 || { echo 'Another installation is running' >&2; exit 75; }
+work=$(mktemp -d "$root/tmp/firmware-install.XXXXXX")
+mounted=
+cleanup() {
+	if [ -n "$mounted" ] && ! umount "$mounted"; then
+		echo "Still mounted: $mounted; leaving temporary files" >&2
+		return
+	fi
+	rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+device_matches() {
+	local id expected
+	id=$(cat "$2/dev")
+	expected=$(printf '%x:%x' "${id%:*}" "${id#*:}")
+	[ "$(stat -L -c %t:%T "$1")" = "$expected" ] || die 'device node/sysfs mismatch'
+}
+# Resolve by physical geometry, not MTD numbering or the stock environment name.
+nor_partition() {
+	local entry found=
+	for entry in "$root"/sys/class/mtd/mtd[0-9]*; do
+		[ -r "$entry/name" ] || continue
+		[ "$(cat "$entry/name")" = "$1" ] || continue
+		[ "$(cat "$entry/offset")" = "$2" ] || continue
+		[ "$(cat "$entry/size")" = "$3" ] || continue
+		[ "$(cat "$entry/erasesize")" = 65536 ] || continue
+		[ "$(cat "$entry/type")" = nor ] || continue
+		[ -z "$found" ] || die 'ambiguous NOR map'
+		found=$root/dev/${entry##*/}
+		device_matches "$found" "$entry"
+	done
+	[ -n "$found" ] || die "unexpected $1 NOR geometry"
+	[ "$(stat -L -c %F "$found")" = 'character special file' ] || die 'not an MTD device'
+	printf '%s\n' "$found"
+}
+envdev=$(nor_partition RootFS2 13631488 3145728)
+printf '%s 0x180000 0x1000 0x10000\n%s 0x190000 0x1000 0x10000\n' \
+	"$envdev" "$envdev" > "$work/fw_env.config"
+env_get() { fw_printenv -c "$work/fw_env.config" -n "$1"; }
+env_save() { fw_setenv -c "$work/fw_env.config" -s "$work/environment"; }
+
+running_slot() {
+	local number candidate
+	number=$(awk '$5 == "/" { print $3; exit }' "$root/proc/self/mountinfo")
+	for candidate in 0 1; do
+		if [ "$number" = "$(cat "$root/sys/class/block/md$candidate/dev")" ]; then
+			if [ "$candidate" = 0 ]; then echo A; else echo B; fi
+			return
+		fi
+	done
+	die 'root is not a system array'
+}
+state() {
+	[ "$(env_get firmware_layout)" = 1 ] || die 'boot environment is not initialized'
+	active=$(env_get active_slot); rollback=$(env_get rollback_slot)
+	case "$active:$rollback" in A:A|A:B|B:A|B:B) ;; *) die 'invalid slots' ;; esac
+	highwater=$(env_get release_sequence); trial=$(env_get upgrade_available)
+	printf '%s\n' "$highwater" | grep -Eq '^(0|[1-9][0-9]{0,9})$' || die 'invalid release sequence'
+	case "$trial" in 0|1) ;; *) die 'invalid trial state' ;; esac
+	running=$(running_slot)
+	grep -Eq '(^| )firmware.layout=1( |$)' "$root/proc/cmdline" || die 'unsupported bootloader path'
+	grep -Eq "(^| )firmware.slot=$running( |$)" "$root/proc/cmdline" || die 'boot slot/root mismatch'
+	read -r installed_slot installed_sequence < "$config/installed"
+	[ "$installed_slot" = "$running" ] || die 'installed slot/root mismatch'
+	printf '%s\n' "$installed_sequence" | grep -Eq '^[1-9][0-9]{0,9}$' || die 'invalid installed identity'
+}
+arrays() {
+	local array part expected slaves disk entry start length
+	for array in md0 md1; do
+		entry=$root/sys/class/block/$array
+		[ "$(cat "$entry/md/level")" = raid1 ] || die "$array is not RAID1"
+		[ "$(cat "$entry/md/metadata_version")" = 0.90 ] || die "$array needs metadata 0.90"
+		[ "$(cat "$entry/md/raid_disks")" = 2 ] || die "$array needs two members"
+		[ "$(cat "$entry/md/degraded")" = 0 ] || die "$array is degraded"
+		[ "$(cat "$entry/md/sync_action")" = idle ] || die "$array is busy"
+		if [ "$array" = md0 ]; then part=1; else part=2; fi
+		slaves=$(for device in "$entry/slaves/"*; do basename "$device"; done | sort)
+		expected=$(printf 'sda%s\nsdb%s\n' "$part" "$part")
+		[ "$slaves" = "$expected" ] || die "$array has unexpected members"
+	done
+	for disk in sda sdb; do
+		[ "$(stat -L -c %F "$root/dev/$disk")" = 'block special file' ] || die 'not a disk'
+		device_matches "$root/dev/$disk" "$root/sys/class/block/$disk"
+		[ "$(blockdev --getss "$root/dev/$disk")" = 512 ] || die 'unsupported sector size'
+		for entry in "$root/sys/class/block/$disk"[0-9]*; do
+			start=$(cat "$entry/start"); length=$(cat "$entry/size")
+			[ "$start" -ge 264192 ] || [ "$((start + length))" -le 2048 ] ||
+				die "$disk partition overlaps the reserved kernels"
+		done
+	done
+}
+unmounted_slot() {
+	local device number
+	for device in "$1" "sda$2" "sdb$2"; do
+		number=$(cat "$root/sys/class/block/$device/dev")
+		awk -v n="$number" '$3 == n { found=1 } END { exit found }' \
+			"$root/proc/self/mountinfo" || die "$device is mounted"
+	done
+}
+backup_nor() {
+	local destination="$1" fs
+	[ -d "$destination" ] || die 'mount an external backup directory first'
+	fs=$(stat -f -c %T "$destination")
+	case "$fs" in tmpfs|ramfs|overlayfs) die 'backup must not live in RAM' ;; esac
+	[ "$(stat -c %d "$destination")" != "$(stat -c %d "$root/")" ] || die 'use a separately mounted backup filesystem'
+	backup=$(mktemp -d "$destination/firmware-$tag.XXXXXX")
+	dd if="$envdev" of="$backup/RootFS2.bin" bs=65536 count=48
+	[ "$(wc -c < "$backup/RootFS2.bin")" = 3145728 ] || die 'short environment backup'
+	bootdev=$(nor_partition U-Boot 0 524288)
+	dd if="$bootdev" of="$backup/u-boot.bin" bs=65536 count=8
+	[ "$(wc -c < "$backup/u-boot.bin")" = 524288 ] || die 'short bootloader backup'
+	(cd "$backup"; sha256sum RootFS2.bin u-boot.bin > SHA256SUMS)
+	sync
+	echo "NOR backup: $backup" >&2
+}
+
+case "$mode" in
+status)
+	state
+	[ "$trial" = 0 ] && [ "$running" = "$active" ] || die 'trial boot needs confirmation'
+	printf '%s\n' "$highwater"
+	exit 0 ;;
+confirm)
+	state
+	[ "$trial" = 1 ] || exit 0
+	if [ "$running" = "$active" ]; then
+		[ "$installed_sequence" = "$highwater" ] || die 'trial release identity mismatch'
+		arrays
+		awk '$2 == "/" && $3 == "ext4" && $4 ~ /(^|,)rw(,|$)/ { ok=1 } END { exit !ok }' \
+			"$root/proc/mounts" || die 'root is not writable ext4'
+		pidof qcontrol >/dev/null || die 'fan control is not running'
+		ubus call network.interface.lan status | jsonfilter -e '@.up' | grep -qx true || die 'LAN is not up'
+		[ "$(cat "$root/sys/class/net/eth0/carrier")" = 1 ] || die 'Ethernet has no carrier'
+	else
+		# Cancel the failed trial; external faults must not reboot-loop the old root.
+		[ "$running" = "$rollback" ] && [ "$installed_sequence" -le "$highwater" ] || die 'invalid rollback identity'
+	fi
+	printf 'active_slot %s\nrollback_slot %s\nupgrade_available 0\nbootcount 0\n' \
+		"$running" "$running" > "$work/environment"
+	env_save
+	logger -t firmware "Confirmed $running/$installed_sequence; high-water $highwater"
+	exit 0 ;;
+esac
+
+stage=$(readlink -f "$1")
+verify_manifest "$stage"
+if [ "$mode" = u-boot ]; then
+	[ "$3" = --flash-nor ] || usage
+	verify_file "u-boot-$board.kwb"
+	image=$stage/u-boot-$board.kwb
+	backup_nor "$2"
+	# No automatic restore: a second erase after a failed flash adds another risk.
+	mtd write "$image" "$bootdev" || die "flash failed; retain RAM session and recover using $backup"
+	[ "$(head -c "$size" "$bootdev" | sha256sum | cut -d ' ' -f1)" = "$hash" ] ||
+		die "NOR readback failed; retain RAM session and recover using $backup"
+	echo 'U-Boot verified. Reboot only after checking the boot environment.'
+	exit 0
+fi
+verify_file "openwrt-$board.tar.gz"
+arrays
+if [ "$mode" = init ]; then
+	[ "$3" = --erase-system ] || usage
+	awk '$2 == "/" { fs=$3 } END { exit !(fs == "rootfs" || fs == "tmpfs" || fs == "ramfs") }' \
+		"$root/proc/mounts" || die 'initial installation requires the RAM recovery image'
+	unmounted_slot md0 1
+	unmounted_slot md1 2
+	backup_nor "$2"
+	slots='A B'
+else
+	state
+	[ "$trial" = 0 ] && [ "$running" = "$active" ] || die 'finish the current trial first'
+	[ "$sequence" -gt "$highwater" ] || die 'release sequence is not newer'
+	if [ "$active" = A ]; then slots=B; else slots=A; fi
+	sysupgrade -b "$work/config.tar.gz"
+fi
+
+# Extract only the two expected regular payloads from the signed outer bundle.
+tar -xOzf "$stage/openwrt-$board.tar.gz" ./rootfs.tar.gz > "$work/rootfs.tar.gz"
+tar -xOzf "$stage/openwrt-$board.tar.gz" ./kernel.uImage > "$work/kernel.uImage"
+tar -tzf "$work/rootfs.tar.gz" > "$work/contents"
+awk '/^\// || /(^|\/)\.\.(\/|$)/ { bad=1 } END { exit bad }' "$work/contents" || die 'unsafe rootfs paths'
+kernel_size=$(wc -c < "$work/kernel.uImage")
+[ "$kernel_size" -ge 64 ] && [ "$kernel_size" -le 16777216 ] || die 'kernel exceeds the boot read window'
+# BusyBox od lacks GNU's -A/-N; hash the magic bytes instead (27 05 19 56).
+[ "$(dd if="$work/kernel.uImage" bs=1 count=4 2>/dev/null | sha256sum | cut -d ' ' -f1)" = 45f39b4a3c7439d22f85c4e827db13e52e96b5f385eb17f569fff37b271dde03 ] || die 'not a uImage'
+kernel_hash=$(sha256sum "$work/kernel.uImage" | cut -d ' ' -f1)
+for slot in $slots; do
+	if [ "$slot" = A ]; then array=md0; part=1; lba=2048; else array=md1; part=2; lba=133120; fi
+	unmounted_slot "$array" "$part"
+	[ "$(stat -L -c %F "$root/dev/$array")" = 'block special file' ] || die 'not a system array'
+	device_matches "$root/dev/$array" "$root/sys/class/block/$array"
+	mkfs.ext4 -F "$root/dev/$array"
+	mkdir -p "$work/root"
+	mount -t ext4 "$root/dev/$array" "$work/root"
+	mounted=$work/root
+	tar -xzf "$work/rootfs.tar.gz" -C "$mounted"
+	if [ "$mode" = upgrade ]; then
+		# Restore OpenWrt's configuration backup, but keep the new boot/update contract.
+		tar -xzf "$work/config.tar.gz" -C "$mounted" --exclude='etc/firmware' --exclude='./etc/firmware'
+		rm -f "$mounted/etc/uci-defaults/ts221"
+	fi
+	cmp "$config/release.pub" "$mounted/etc/firmware/release.pub"
+	cmp "$config/repository" "$mounted/etc/firmware/repository"
+	printf '%s %s\n' "$slot" "$sequence" > "$mounted/etc/firmware/installed"
+	sync
+	umount "$mounted"
+	mounted=
+	e2fsck -fn "$root/dev/$array"
+	for disk in sda sdb; do
+		dd if="$work/kernel.uImage" of="$root/dev/$disk" bs=512 seek="$lba" conv=notrunc,fsync
+		readback=$(dd if="$root/dev/$disk" bs=512 skip="$lba" count="$(( (kernel_size + 511) / 512 ))" |
+			head -c "$kernel_size" | sha256sum | cut -d ' ' -f1)
+		[ "$readback" = "$kernel_hash" ] || die "$disk kernel readback failed"
+	done
+done
+sync
+arrays
+if [ "$mode" = init ]; then
+	sed 's/=/ /' "$config/boot.env" > "$work/environment"
+	printf 'active_slot A\nrollback_slot B\nrelease_sequence %s\nupgrade_available 1\nbootcount 0\n' \
+		"$sequence" >> "$work/environment"
+else
+	printf 'active_slot %s\nrollback_slot %s\nrelease_sequence %s\nupgrade_available 1\nbootcount 0\n' \
+		"$slots" "$active" "$sequence" > "$work/environment"
+fi
+env_save
+if [ "$mode" = upgrade ]; then
+	logger -t firmware "Installed $tag to $slots; activates at next reboot"
+	echo "Update staged in slot $slots. Reboot to activate it and start the trial."
+else
+	echo 'Both system slots installed. Qualify and flash this release U-Boot before rebooting.'
+fi

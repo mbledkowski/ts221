@@ -1,0 +1,132 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+PORT="${Q703_LED_PORT:-/dev/ttyS1}"
+POLL="${Q703_LED_POLL:-10}"          # seconds between health evaluations
+THERMAL_TEMP="${Q703_THERMAL_TEMP:-/sys/class/thermal/thermal_zone0/temp}"
+THERMAL_FULL_C="${Q703_THERMAL_FULL_C:-65}"
+THERMAL_POWEROFF_C="${Q703_THERMAL_POWEROFF_C:-70}"
+MDSTAT="${Q703_MDSTAT:-/proc/mdstat}"
+# Fault detection covers the system arrays only (md0 on part 1, md1 on part
+# 2); the remaining data partition is deliberately not a RAID member.
+MD_PARTS="${Q703_MD_PARTS:-1 2}"
+HDD1_FAULT_LED="${Q703_HDD1_FAULT_LED:-/sys/class/leds/q703:red:hdd1-fault/brightness}"
+HDD2_FAULT_LED="${Q703_HDD2_FAULT_LED:-/sys/class/leds/q703:red:hdd2-fault/brightness}"
+POWEROFF_CMD="${Q703_POWEROFF_CMD:-/sbin/poweroff}"
+
+PIC_FAN_FULL_OCTAL='\065'
+PIC_FAN_FULL_HEX='0x35'
+PIC_STATUS_GREENON_OCTAL='\126'  # 0x56
+PIC_STATUS_REDON_OCTAL='\127'    # 0x57
+PIC_STATUS_GREENON_HEX='0x56'
+PIC_STATUS_REDON_HEX='0x57'
+
+log() { logger -t q703-leds "$@" 2>/dev/null || echo "q703-leds: $*" >&2; }
+
+PIC_HELPER="${Q703_PIC_HELPER:-/usr/sbin/q703-pic}"
+[ -x "$PIC_HELPER" ] || PIC_HELPER=""
+
+pic_write() {
+	if [ -n "$PIC_HELPER" ]; then
+		"$PIC_HELPER" "$PORT" send "$2" 2>/dev/null
+		return
+	fi
+	printf '%b' "$1" > "$PORT" 2>/dev/null
+}
+
+read_soc_temp() {
+	[ -r "$THERMAL_TEMP" ] || return 1
+	raw="$(cat "$THERMAL_TEMP" 2>/dev/null)"
+	case "$raw" in
+		*[!0-9]*|'') return 1 ;;
+	esac
+	echo $((raw / 1000))
+}
+
+md_degraded() {
+	[ -r "$MDSTAT" ] || return 1
+	if grep -qE '\[[U_]*_[U_]*\]' "$MDSTAT" 2>/dev/null; then
+		return 0
+	fi
+	if grep -qiE 'recovery|resync' "$MDSTAT" 2>/dev/null; then
+		return 0
+	fi
+	return 1
+}
+
+disk_fault_state() {
+	disk="$1"
+	mdstat="$2"
+	parts="${3:-$MD_PARTS}"
+	[ -r "$mdstat" ] || { echo 1; return; }
+	for part in $parts; do
+		member="${disk}${part}"
+		if ! grep -qE "(^|[[:space:]])${member}\\[[0-9]+\\]" "$mdstat"; then
+			echo 1
+			return
+		fi
+		if grep -qE "(^|[[:space:]])${member}\\[[0-9]+\\]\\(F\\)" "$mdstat"; then
+			echo 1
+			return
+		fi
+	done
+	echo 0
+}
+
+update_disk_fault_leds() {
+	[ -w "$HDD1_FAULT_LED" ] &&
+		disk_fault_state sda "$MDSTAT" > "$HDD1_FAULT_LED"
+	[ -w "$HDD2_FAULT_LED" ] &&
+		disk_fault_state sdb "$MDSTAT" > "$HDD2_FAULT_LED"
+}
+
+if [ "${1:-}" = "disk-fault-state" ]; then
+	[ "$#" -ge 3 ] && [ "$#" -le 4 ] ||
+		{ echo "usage: $0 disk-fault-state <disk> <mdstat> [parts]" >&2; exit 2; }
+	disk_fault_state "$2" "$3" "${4:-}"
+	exit 0
+fi
+
+main() {
+	log "slim mode: HDD fault LEDs + SoC-thermal fail-safe; PIC roles owned by qcontrol"
+
+	last_status=""
+	last_fan_full=""
+
+	while :; do
+		update_disk_fault_leds
+
+		if md_degraded; then
+			want_status="$PIC_STATUS_REDON_OCTAL"
+			want_status_hex="$PIC_STATUS_REDON_HEX"
+		else
+			want_status="$PIC_STATUS_GREENON_OCTAL"
+			want_status_hex="$PIC_STATUS_GREENON_HEX"
+		fi
+		if [ "$want_status" != "$last_status" ]; then
+			pic_write "$want_status" "$want_status_hex"
+			last_status="$want_status"
+		fi
+
+		if temp="$(read_soc_temp)"; then
+			if [ "$temp" -ge "$THERMAL_POWEROFF_C" ]; then
+				log "SoC temp ${temp}C >= ${THERMAL_POWEROFF_C}C -> shutdown"
+				pic_write "$PIC_FAN_FULL_OCTAL" "$PIC_FAN_FULL_HEX"
+				$POWEROFF_CMD
+				exit 0
+			fi
+			if [ "$temp" -ge "$THERMAL_FULL_C" ] &&
+				[ "$last_fan_full" != "$temp" ]; then
+				pic_write "$PIC_FAN_FULL_OCTAL" "$PIC_FAN_FULL_HEX"
+				last_fan_full="$temp"
+				log "SoC temp ${temp}C >= ${THERMAL_FULL_C}C -> fan full fail-safe"
+			fi
+		else
+			log "warning: SoC thermal zone $THERMAL_TEMP unreadable"
+		fi
+
+		sleep "$POLL"
+	done
+}
+
+main "$@"

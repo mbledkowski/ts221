@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+uci set network.lan=interface
+uci set network.lan.device=eth0
+uci set network.lan.proto=dhcp
+uci -q delete network.lan.ipaddr
+uci -q delete network.lan.netmask
+uci set dhcp.lan.ignore=1
+# MD 0.90 member filesystems must never be anonymously mounted.
+uci set 'fstab.@global[0].anon_mount=0'
+# Experimental NOR activation is opt-in; the backup directory must be a
+# separately mounted filesystem (see update.md step 5).
+uci set firmware.nor=firmware
+uci set firmware.nor.auto='0'
+uci set firmware.nor.backup_dir='/mnt/backup'
+uci commit
+exit 0

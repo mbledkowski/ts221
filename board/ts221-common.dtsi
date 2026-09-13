@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: GPL-2.0
+/* Shared wiring from Linux kirkwood-ts219-6282.dts. */
+
+#include "kirkwood.dtsi"
+#include "kirkwood-6282.dtsi"
+#include "kirkwood-ts219.dtsi"
+
+/ {
+	/* Both TS-221 and Q703 have 1 GiB; the family default is 512 MiB. */
+	memory {
+		reg = <0x00000000 0x40000000>;
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-0 = <&pmx_reset_button &pmx_copy_button>;
+		pinctrl-names = "default";
+
+		button-copy {
+			label = "USB Copy";
+			linux,code = <KEY_COPY>;
+			gpios = <&gpio1 11 GPIO_ACTIVE_LOW>;
+		};
+
+		button-reset {
+			label = "Reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&gpio1 5 GPIO_ACTIVE_LOW>;
+		};
+	};
+};
+
+&ethphy0 {
+	reg = <0>;
+};
+
+&pcie1 {
+	status = "okay";
+};
+
+&pinctrl {
+	pinctrl-0 = <&pmx_ram_size &pmx_board_id>;
+	pinctrl-names = "default";
+
+	pmx_board_id: pmx-board-id {
+		/* Family strap: TS-11x / TS-21x. */
+		marvell,pins = "mpp44";
+		marvell,function = "gpio";
+	};
+
+	pmx_copy_button: pmx-copy-button {
+		marvell,pins = "mpp43";
+		marvell,function = "gpio";
+	};
+
+	pmx_ram_size: pmx-ram-size {
+		/* Preserve the family strap mux; it does not size 1 GiB RAM. */
+		marvell,pins = "mpp36";
+		marvell,function = "gpio";
+	};
+
+	pmx_reset_button: pmx-reset-button {
+		marvell,pins = "mpp37";
+		marvell,function = "gpio";
+	};
+};

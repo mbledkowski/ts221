@@ -1,0 +1,464 @@
+Subject: [PATCH] kirkwood: Q703 board and Ethernet support
+
+Derived from the scratchpad board port. Shared raw-disk A/B boot environment,
+redundant SPI state and no factory MAC or duplicate device-tree sources.
+
+diff --git a/arch/arm/mach-kirkwood/Kconfig b/arch/arm/mach-kirkwood/Kconfig
+index f1ccedba5d74e400f53420a91e95adb569b56cf5..9e74a56a9aaa6a3c0a1efc5cb59f5f50743e4323 100644
+--- a/arch/arm/mach-kirkwood/Kconfig
++++ b/arch/arm/mach-kirkwood/Kconfig
+@@ -149,6 +149,12 @@ config TARGET_NSA325
+ 	select KW88F6281
+ 	select KIRKWOOD_COMMON
+ 
++config TARGET_QNAP_TS221
++	bool "QNAP TS-221 / Fujitsu CELVIN Q703"
++	select FEROCEON_88FR131
++	select KW88F6281
++	select KIRKWOOD_COMMON
++
+ config TARGET_SBx81LIFKW
+ 	bool "Allied Telesis SBx81GS24/SBx81GT40/SBx81XS6/SBx81XS16"
+ 	select FEROCEON_88FR131
+@@ -196,6 +202,7 @@ source "board/Seagate/goflexhome/Kconfig"
+ source "board/Seagate/nas220/Kconfig"
+ source "board/zyxel/nsa310s/Kconfig"
+ source "board/zyxel/nsa325/Kconfig"
++source "board/qnap/ts221/Kconfig"
+ source "board/alliedtelesis/SBx81LIFKW/Kconfig"
+ source "board/alliedtelesis/SBx81LIFXCAT/Kconfig"
+ 
+diff --git a/drivers/net/Makefile b/drivers/net/Makefile
+index 5e90183d090ef0a602d7b0eeb82aafe3455e5648..db07d1dcbb567237b2b5739000d895810c14ef81 100644
+--- a/drivers/net/Makefile
++++ b/drivers/net/Makefile
+@@ -78,6 +78,8 @@ obj-$(CONFIG_MT7620_ETH) += mt7620-eth.o
+ obj-$(CONFIG_MT7628_ETH) += mt7628-eth.o
+ obj-$(CONFIG_MV88E6XXX) += mv88e6xxx.o
+ obj-$(CONFIG_MVGBE) += mvgbe.o
++# ARMv5 MVGBE DMA descriptor publication needs CP15 DSB, unavailable in Thumb.
++CFLAGS_mvgbe.o := -marm
+ obj-$(CONFIG_MVMDIO) += mvmdio.o
+ obj-$(CONFIG_MVNETA) += mvneta.o
+ obj-$(CONFIG_MVPP2) += mvpp2.o
+diff --git a/drivers/net/mvgbe.c b/drivers/net/mvgbe.c
+index 107a33aa9f54a480ecfabd3c2344d49050efcede..754c3311b4a178a80aa03c30d50133f3c3253605 100644
+--- a/drivers/net/mvgbe.c
++++ b/drivers/net/mvgbe.c
+@@ -34,6 +34,7 @@ DECLARE_GLOBAL_DATA_PTR;
+ #define MV_PHY_ADR_REQUEST 0xee
+ #define MVGBE_SMI_REG (((struct mvgbe_registers *)MVGBE0_BASE)->smi)
+ #define MVGBE_PGADR_REG	22
++#define MVGBE_TX_TIMEOUT_MS	1000
+ 
+ #if defined(CONFIG_PHYLIB) || defined(CONFIG_MII) || defined(CONFIG_CMD_MII)
+ static int smi_wait_ready(struct mvgbe_device *dmvgbe)
+@@ -184,6 +185,7 @@ static int smi_reg_write(struct mii_dev *bus, int phy_adr, int devad,
+ static void stop_queue(u32 * qreg)
+ {
+ 	u32 reg_data;
++	ulong start;
+ 
+ 	reg_data = readl(qreg);
+ 
+@@ -192,12 +194,18 @@ static void stop_queue(u32 * qreg)
+ 		writel((reg_data << 8), qreg);
+ 
+ 		/* Wait for all queue activity to terminate. */
++		start = get_timer(0);
+ 		do {
+ 			/*
+ 			 * Check port cause register that all queues
+ 			 * are stopped
+ 			 */
+ 			reg_data = readl(qreg);
++			if (get_timer(start) > MVGBE_TX_TIMEOUT_MS) {
++				printf("queue stop timeout: qreg=%p value=%08x\n",
++				       qreg, reg_data);
++				break;
++			}
+ 		}
+ 		while (reg_data & 0xFF);
+ 	}
+@@ -456,7 +464,7 @@ static int __mvgbe_init(struct mvgbe_device *dmvgbe, u8 *enetaddr,
+ 	/* Assignment of Rx CRDB of given RXUQ */
+ 	MVGBE_REG_WR(regs->rxcdp[RXUQ], (u32) dmvgbe->p_rxdesc_curr);
+ 	/* ensure previous write is done before enabling Rx DMA */
+-	isb();
++	wmb();
+ 	/* Enable port Rx. */
+ 	MVGBE_REG_WR(regs->rqc, (1 << RXUQ));
+ 
+@@ -505,6 +552,8 @@ static int __mvgbe_send(struct mvgbe_device *dmvgbe, void *dataptr,
+ 	void *p = (void *)dataptr;
+ 	u32 cmd_sts;
+ 	u32 txuq0_reg_addr;
++	struct mvgbe_txdesc *p_txdesc_next = p_txdesc + 1;
++	ulong start;
+ 
+ 	/* Copy buffer if it's misaligned */
+ 	if ((u32) dataptr & 0x07) {
+@@ -520,17 +568,24 @@ static int __mvgbe_send(struct mvgbe_device *dmvgbe, void *dataptr,
+ 
+ 	p_txdesc->cmd_sts = MVGBE_ZERO_PADDING | MVGBE_GEN_CRC;
+ 	p_txdesc->cmd_sts |= MVGBE_TX_FIRST_DESC | MVGBE_TX_LAST_DESC;
+-	p_txdesc->cmd_sts |= MVGBE_BUFFER_OWNED_BY_DMA;
+-	p_txdesc->cmd_sts |= MVGBE_TX_EN_INTERRUPT;
++	p_txdesc->l4i_chk = 0;
+ 	p_txdesc->buf_ptr = (u8 *) p;
+ 	p_txdesc->byte_cnt = datasize;
++	/* Stop after one frame at an explicit, non-DMA-owned ring sentinel. */
++	memset(p_txdesc_next, 0, sizeof(*p_txdesc_next));
++	p_txdesc_next->nxtdesc_p = p_txdesc;
++	p_txdesc->nxtdesc_p = p_txdesc_next;
++	/* Publish descriptor fields before transferring ownership to DMA. */
++	wmb();
++	p_txdesc->cmd_sts |= MVGBE_BUFFER_OWNED_BY_DMA | MVGBE_TX_EN_INTERRUPT;
++	wmb();
+ 
+ 	/* Set this tc desc as zeroth TXUQ */
+ 	txuq0_reg_addr = (u32)&regs->tcqdp[TXUQ];
+ 	writel((u32) p_txdesc, txuq0_reg_addr);
+ 
+-	/* ensure tx desc writes above are performed before we start Tx DMA */
+-	isb();
++	/* Ensure descriptor pointer and ownership reach DMA before queue enable. */
++	wmb();
+ 
+ 	/* Apply send command using zeroth TXUQ */
+ 	MVGBE_REG_WR(regs->tqc, (1 << TXUQ));
+@@ -539,6 +594,7 @@ static int __mvgbe_send(struct mvgbe_device *dmvgbe, void *dataptr,
+ 	 * wait for packet xmit completion
+ 	 */
+ 	cmd_sts = readl(&p_txdesc->cmd_sts);
++	start = get_timer(0);
+ 	while (cmd_sts & MVGBE_BUFFER_OWNED_BY_DMA) {
+ 		/* return fail if error is detected */
+ 		if ((cmd_sts & (MVGBE_ERROR_SUMMARY | MVGBE_TX_LAST_FRAME)) ==
+@@ -547,7 +603,12 @@ static int __mvgbe_send(struct mvgbe_device *dmvgbe, void *dataptr,
+ 			printf("Err..(%s) in xmit packet\n", __func__);
+ 			return -1;
+ 		}
++		if (get_timer(start) > MVGBE_TX_TIMEOUT_MS) {
++			printf("TX timeout: cmd=%08x tqc=%08x psc0=%08x\n",
++			       cmd_sts, readl(&regs->tqc), readl(&regs->psc0));
++			return -ETIMEDOUT;
++		}
+ 		cmd_sts = readl(&p_txdesc->cmd_sts);
+-	};
++	}
+ 	return 0;
+ }
+@@ -672,7 +725,7 @@ static int mvgbe_alloc_buffers(struct mvgbe_device *dmvgbe)
+ 	if (!dmvgbe->p_aligned_txbuf)
+ 		goto error3;
+ 
+-	dmvgbe->p_txdesc = memalign(PKTALIGN, sizeof(struct mvgbe_txdesc) + 1);
++	dmvgbe->p_txdesc = memalign(PKTALIGN, 2 * sizeof(struct mvgbe_txdesc));
+ 	if (!dmvgbe->p_txdesc)
+ 		goto error4;
+ 
+diff --git a/board/qnap/ts221/Kconfig b/board/qnap/ts221/Kconfig
+new file mode 100644
+index 0000000000000000000000000000000000000000..48dcf2b71485307a5e465d0580e35034267dd196
+--- /dev/null
++++ b/board/qnap/ts221/Kconfig
+@@ -0,0 +1,12 @@
++if TARGET_QNAP_TS221
++
++config SYS_BOARD
++	default "ts221"
++
++config SYS_VENDOR
++	default "qnap"
++
++config SYS_CONFIG_NAME
++	default "qnap_ts221"
++
++endif
+diff --git a/board/qnap/ts221/MAINTAINERS b/board/qnap/ts221/MAINTAINERS
+new file mode 100644
+index 0000000000000000000000000000000000000000..bcf1d49c9fdbfba8b721598bc357a86a424650a8
+--- /dev/null
++++ b/board/qnap/ts221/MAINTAINERS
+@@ -0,0 +1,8 @@
++QNAP TS-221 / FUJITSU CELVIN Q703 BOARD
++M:	mbledkowski <pub@mble.dk>
++S:	Maintained
++F:	board/qnap/ts221/
++F:	include/configs/qnap_ts221.h
++F:	configs/qnap_ts221_defconfig
++F:	dts/upstream/src/arm/marvell/kirkwood-q703.dts
++F:	dts/upstream/src/arm/marvell/kirkwood-ts221.dts
+diff --git a/board/qnap/ts221/Makefile b/board/qnap/ts221/Makefile
+new file mode 100644
+index 0000000000000000000000000000000000000000..299d8e1342f7486208cd2dd1e0a876ddffde9c9f
+--- /dev/null
++++ b/board/qnap/ts221/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++#
++# QNAP TS-221 / Fujitsu CELVIN Q703
++
++obj-y	:= ts221.o
+diff --git a/board/qnap/ts221/kwbimage.cfg b/board/qnap/ts221/kwbimage.cfg
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a996978ae795a6c02e0dcaa5df2301b48b053e5
+--- /dev/null
++++ b/board/qnap/ts221/kwbimage.cfg
+@@ -0,0 +1,43 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++#
++# Extracted from stock QNAP TS-221 / Q703 mtd0
++# (U-Boot 1.1.4 Marvell 3.5.3, SPI KWB v0).
++# Do not copy NSA325 DDR timings.
++#
++BOOT_FROM	spi
++
++# SOC registers from the original KWB extension
++# header. Maximum KWBIMAGE_MAX_CONFIG entries.
++
++DATA 0xFFD100E0 0x1B1B9B9B	# RGMII pad voltage
++DATA 0xFFD01400 0x4301503C	# DDR Configuration
++DATA 0xFFD01404 0xB9843000	# DDR Controller Control Low
++DATA 0xFFD01408 0x33136663	# DDR Timing (Low)
++DATA 0xFFD0140C 0x16000C3A	# DDR Timing (High)
++DATA 0xFFD01410 0x04000000	# DDR Address Control
++DATA 0xFFD01414 0x00000000	# DDR Open Pages Control
++DATA 0xFFD01418 0x00000000	# DDR Operation
++DATA 0xFFD0141C 0x00000672	# DDR Mode
++DATA 0xFFD01420 0x00000040	# DDR Extended Mode
++DATA 0xFFD01424 0x0000314F	# DDR Controller Control High
++DATA 0xFFD01428 0x000D6720	# DDR ODT Read Timing
++DATA 0xFFD0147C 0x0000B571	# DDR ODT Write Timing
++DATA 0xFFD01504 0x1FFFFFF1	# CS0 Size
++DATA 0xFFD01508 0x20000000	# CS1 Base
++DATA 0xFFD0150C 0x1FFFFFF5	# CS1 Size
++DATA 0xFFD01514 0x00FFFFF0	# CS2 Size
++DATA 0xFFD0151C 0x00FFFFF0	# CS3 Size
++DATA 0xFFD01494 0x00110000	# DDR ODT Control (Low)
++DATA 0xFFD01498 0x00000000	# DDR ODT Control (High)
++DATA 0xFFD0149C 0x0000E803	# CPU ODT Control
++DATA 0xFFD015D0 0x00000630
++DATA 0xFFD015D4 0x00000046
++DATA 0xFFD015D8 0x00000008
++DATA 0xFFD015DC 0x00000000
++DATA 0xFFD015E0 0x00000003
++DATA 0xFFD015E4 0x00203C18
++DATA 0xFFD01620 0x00680000
++DATA 0xFFD01480 0x00000001	# DDR init enable
++DATA 0xFFD20134 0x66666666
++DATA 0xFFD20138 0x66666666
++DATA 0x0 0x0
+diff --git a/board/qnap/ts221/ts221.c b/board/qnap/ts221/ts221.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..76f41921ffd42589cc286c8692dae24039b4b0dc
+--- /dev/null
++++ b/board/qnap/ts221/ts221.c
+@@ -0,0 +1,102 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * QNAP TS-221 / Fujitsu CELVIN Q703
++ *
++ * SPI NOR, two SATA ports, 88F6282, 1 GiB DRAM.
++ * MPP list follows the TS-219 family Linux DT (SPI, UART,
++ * TWSI, SATA activity) plus documented GPIOs 36/37/43/44.
++ */
++
++#include <init.h>
++#include <netdev.h>
++#include <asm/arch/cpu.h>
++#include <asm/arch/soc.h>
++#include <asm/arch/mpp.h>
++#include <asm/global_data.h>
++#include <asm/io.h>
++
++DECLARE_GLOBAL_DATA_PTR;
++
++int board_early_init_f(void)
++{
++	u32 reg;
++
++	/*
++	 * Leave GPIO output enables at reset defaults until
++	 * LED wiring is measured on hardware.
++	 */
++	mvebu_config_gpio(0, 0, 0, 0);
++
++	static const u32 kwmpp_config[] = {
++		MPP0_SPI_SCn,
++		MPP1_SPI_MOSI,
++		MPP2_SPI_SCK,
++		MPP3_SPI_MISO,
++		MPP4_GPIO,
++		MPP5_GPO,
++		MPP6_SYSRST_OUTn,
++		MPP7_GPO,
++		MPP8_TW_SDA,
++		MPP9_TW_SCK,
++		MPP10_UART0_TXD,
++		MPP11_UART0_RXD,
++		MPP12_GPO,
++		MPP13_UART1_TXD,
++		MPP14_UART1_RXD,
++		MPP15_GPIO,
++		MPP16_GPIO,
++		MPP17_GPIO,
++		MPP18_GPO,
++		MPP19_GPO,
++		MPP20_SATA1_ACTn,
++		MPP21_SATA0_ACTn,
++		MPP22_GPIO,
++		MPP23_GPIO,
++		MPP24_GPIO,
++		MPP25_GPIO,
++		MPP26_GPIO,
++		MPP27_GPIO,
++		MPP28_GPIO,
++		MPP29_GPIO,
++		MPP30_GPIO,
++		MPP31_GPIO,
++		MPP32_GPIO,
++		MPP33_GPIO,
++		MPP34_GPIO,
++		MPP35_GPIO,
++		MPP36_GPIO,	/* RAM size strap */
++		MPP37_GPIO,	/* Reset button */
++		MPP38_GPIO,
++		MPP39_GPIO,
++		MPP40_GPIO,
++		MPP41_GPIO,
++		MPP42_GPIO,
++		MPP43_GPIO,	/* USB Copy button */
++		MPP44_GPIO,	/* board id strap */
++		MPP45_GPIO,
++		MPP46_GPIO,
++		MPP47_GPIO,
++		MPP48_GPIO,
++		MPP49_GPIO,
++		0
++	};
++
++	kirkwood_mpp_conf(kwmpp_config, NULL);
++
++	/* Release GE0 from reset without touching the absent GE1 block. */
++	reg = readl(KWGBE_PORT_SERIAL_CONTROL1_REG(0));
++	reg &= ~(1 << 4);
++	writel(reg, KWGBE_PORT_SERIAL_CONTROL1_REG(0));
++	return 0;
++}
++
++int board_eth_init(struct bd_info *bis)
++{
++	return cpu_eth_init(bis);
++}
++
++int board_init(void)
++{
++	gd->bd->bi_boot_params = mvebu_sdram_bar(0) + 0x100;
++	return 0;
++}
+diff --git a/configs/qnap_ts221_defconfig b/configs/qnap_ts221_defconfig
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0f2dbde690db4865ccbc2aa8baabb89c223a4bf
+--- /dev/null
++++ b/configs/qnap_ts221_defconfig
+@@ -0,0 +1,80 @@
++CONFIG_ARM=y
++CONFIG_SKIP_LOWLEVEL_INIT=y
++CONFIG_SYS_DCACHE_OFF=y
++CONFIG_ARCH_CPU_INIT=y
++CONFIG_SYS_THUMB_BUILD=y
++CONFIG_ARCH_KIRKWOOD=y
++CONFIG_SUPPORT_PASSING_ATAGS=y
++CONFIG_CMDLINE_TAG=y
++CONFIG_INITRD_TAG=y
++CONFIG_SYS_KWD_CONFIG="board/qnap/ts221/kwbimage.cfg"
++CONFIG_TEXT_BASE=0x600000
++CONFIG_NR_DRAM_BANKS=2
++CONFIG_TARGET_QNAP_TS221=y
++# The Q703/TS-221 routes only Kirkwood egiga0.  The generic early-init option
++# blindly touches egiga1 too; that controller is gated on this board and a
++# read faults before U-Boot can initialize its real eth0 driver.
++# CONFIG_KIRKWOOD_EGIGA_INIT is not set
++CONFIG_ENV_SIZE=0x1000
++CONFIG_ENV_SECT_SIZE=0x10000
++CONFIG_ENV_OFFSET=0xe80000
++CONFIG_ENV_OFFSET_REDUND=0xe90000
++CONFIG_ENV_SOURCE_FILE="ts221"
++CONFIG_DEFAULT_DEVICE_TREE="marvell/kirkwood-q703"
++CONFIG_SYS_LOAD_ADDR=0x800000
++CONFIG_IDENT_STRING=""
++CONFIG_PCI=y
++CONFIG_LTO=y
++CONFIG_BOOTDELAY=3
++CONFIG_HUSH_PARSER=y
++CONFIG_CMD_RUN=y
++CONFIG_CMD_SLEEP=y
++CONFIG_CMD_IMI=y
++CONFIG_CMD_BOOTM=y
++CONFIG_CMD_SATA=y
++CONFIG_SYS_PROMPT="Marvell>> "
++CONFIG_CMD_I2C=y
++CONFIG_CMD_MTD=y
++CONFIG_CMD_PCI=y
++CONFIG_CMD_USB=y
++CONFIG_CMD_DNS=y
++CONFIG_CMD_SNTP=y
++CONFIG_CMD_GPT=y
++CONFIG_PARTITION_TYPE_GUID=y
++CONFIG_OF_CONTROL=y
++CONFIG_ENV_IS_IN_SPI_FLASH=y
++CONFIG_ENV_REDUNDANT=y
++CONFIG_CMD_SAVEENV=y
++CONFIG_BOOTCOUNT_LIMIT=y
++CONFIG_BOOTCOUNT_ENV=y
++CONFIG_NET_RANDOM_ETHADDR=y
++CONFIG_VERSION_VARIABLE=y
++CONFIG_NETCONSOLE=y
++CONFIG_SATA=y
++CONFIG_SATA_MV=y
++CONFIG_SYS_SATA_MAX_DEVICE=2
++CONFIG_LBA48=y
++CONFIG_SYS_64BIT_LBA=y
++CONFIG_DM_I2C=y
++CONFIG_SYS_I2C_MVTWSI=y
++# CONFIG_MMC is not set
++CONFIG_MTD=y
++CONFIG_DM_SPI_FLASH=y
++CONFIG_SPI_FLASH_MACRONIX=y
++CONFIG_SPI_FLASH_STMICRO=y
++CONFIG_SPI_FLASH_WINBOND=y
++CONFIG_MVGBE=y
++CONFIG_MII=y
++CONFIG_PHY_MARVELL=y
++CONFIG_PCI_MVEBU=y
++CONFIG_SPI=y
++CONFIG_DM_SPI=y
++CONFIG_KIRKWOOD_SPI=y
++CONFIG_USB=y
++CONFIG_USB_XHCI_HCD=y
++CONFIG_USB_XHCI_PCI=y
++CONFIG_USB_EHCI_HCD=y
++CONFIG_USB_STORAGE=y
++CONFIG_FIT=y
++CONFIG_CMD_EXT4=y
++CONFIG_CMD_FAT=y
+diff --git a/include/configs/qnap_ts221.h b/include/configs/qnap_ts221.h
+new file mode 100644
+--- /dev/null
++++ b/include/configs/qnap_ts221.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef _CONFIG_QNAP_TS221_H
++#define _CONFIG_QNAP_TS221_H
++
++#include "mv-common.h"
++
++#define CFG_EXTRA_ENV_SETTINGS \
++	"kernel_addr_r=0x00800000\0" \
++	"fdt_addr_r=0x02c00000\0" \
++	"ramdisk_addr_r=0x01100000\0" \
++	"scriptaddr=0x00200000\0"
++
++#endif

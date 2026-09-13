@@ -1,0 +1,105 @@
+Subject: [PATCH] ts219: add Q703 PIC link/eSATA events and vendor fan repeat
+
+Three changes grounded in the Fujitsu CELVIN Q703 (QNAP TS-221) front-panel
+PIC, its vendor picd binary, and cross-build practice:
+
+* The PIC reports front LAN link (0xcd up / 0xce down) and eSATA slot
+  events (0xd3 inserted / 0xd4 removed) to the host.  Forward them to the
+  Lua config as lan_link() and esata_event() so a board config can react
+  to the events.  (The eSATA LED itself is PIC-firmware driven from the
+  slot monitor: verified on hardware that no host byte changes it, and
+  the vendor daemons never send one.)
+* The vendor picd repeats every fan command one second apart, so a byte
+  dropped while the PIC streams status still gets through.  Do the same
+  in the fanspeed command.
+* Make the lua5.1 lookup overridable (LUA_CFLAGS/LUA_LIBDIR/LUA_LIB) so
+  cross builds without a host pkg-config lua5.1 module can point at an
+  OpenWrt staging sysroot, where the static library is liblua.a.
+
+---
+diff --git a/Makefile b/Makefile
+index 72a33a6..e2b40a9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -6,9 +6,14 @@ CPPFLAGS += -DQCONTROL_VERSION=\"$(VERSION)\"
+ PKG_CONFIG ?= pkg-config
+ LDFLAGS  += -g
+ 
+-CFLAGS       += $(shell $(PKG_CONFIG) --cflags lua5.1)
++# Cross builds (OpenWrt) pass these instead of a host pkg-config module.
++LUA_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags lua5.1)
++LUA_LIBDIR ?= $(shell $(PKG_CONFIG) --variable=libdir lua5.1)
++LUA_LIB ?= liblua5.1.a
++
++CFLAGS       += $(LUA_CFLAGS)
+ LIBS_DYNAMIC += -lpthread $(shell $(PKG_CONFIG) --libs lua5.1)
+-LIBS_STATIC  += -lpthread $(shell $(PKG_CONFIG) --variable=libdir lua5.1)/liblua5.1.a -lm -ldl
++LIBS_STATIC  += -lpthread $(LUA_LIBDIR)/$(LUA_LIB) -lm -ldl
+ 
+ ifeq ($(shell $(PKG_CONFIG) --exists libsystemd-daemon 2>/dev/null && echo 1),1)
+ CPPFLAGS_DYNAMIC += -DHAVE_SYSTEMD
+diff --git a/qnap-pic.c b/qnap-pic.c
+index 51bb132..857c7d0 100644
+--- a/qnap-pic.c
++++ b/qnap-pic.c
+@@ -250,6 +250,7 @@ static int qnap_cmd_buzzer(int argc, const char **argv)
+ static int qnap_cmd_fanspeed(int argc, const char **argv)
+ {
+ 	unsigned char code = 0;
++	int err;
+ 
+ 	if (argc != 1)
+ 		return -1;
+@@ -269,6 +270,12 @@ static int qnap_cmd_fanspeed(int argc, const char **argv)
+ 	else
+ 		return -1;
+ 
++	/* The vendor picd repeats every fan command one second apart, so a
++	 * byte dropped while the PIC streams status still gets through. */
++	err = qnap_serial_write(&code, 1);
++	if (err < 0)
++		return err;
++	sleep(1);
+ 	return qnap_serial_write(&code, 1);
+ }
+ 
+diff --git a/qnap-pic.h b/qnap-pic.h
+index e6f980f..badf514 100644
+--- a/qnap-pic.h
++++ b/qnap-pic.h
+@@ -93,6 +93,12 @@ int qnap_register_commands(unsigned long features);
+ 
+ #define QNAP_PICCMD_WDT_OFF			0x67
+ 
++#define QNAP_PICSTS_LAN_LINK_UP			0xcd
++#define QNAP_PICSTS_LAN_LINK_DOWN		0xce
++
++#define QNAP_PICSTS_ESATA_INSERTED		0xd3
++#define QNAP_PICSTS_ESATA_REMOVED		0xd4
++
+ #define QNAP_PICSTS_FAN1_ERROR			0x73
+ #define QNAP_PICSTS_FAN1_NORMAL			0x74
+ #define QNAP_PICSTS_FAN2_ERROR			0x75
+diff --git a/ts219.c b/ts219.c
+index 57d32be..28ef1f9 100644
+--- a/ts219.c
++++ b/ts219.c
+@@ -58,6 +58,18 @@ static void ts219_dispatch_byte(unsigned char byte)
+ 	case QNAP_PICSTS_SYS_TEMP_80:
+ 		call_function("temp", "%d", 80);
+ 		break;
++	case QNAP_PICSTS_LAN_LINK_UP:
++		call_function("lan_link", "%d", 1);
++		break;
++	case QNAP_PICSTS_LAN_LINK_DOWN:
++		call_function("lan_link", "%d", 0);
++		break;
++	case QNAP_PICSTS_ESATA_INSERTED:
++		call_function("esata_event", "%d", 1);
++		break;
++	case QNAP_PICSTS_ESATA_REMOVED:
++		call_function("esata_event", "%d", 0);
++		break;
+ 	default:
+ 		print_log(LOG_WARNING, "(PIC 0x%x) unknown command from PIC",
+ 			  byte);

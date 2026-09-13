@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: GPL-2.0
+// GPIO/NOR/reset additions are Q703-tested, and have not been verified on TS-221.
+// Their placement here does not establish a hardware difference.
+/dts-v1/;
+
+#include "ts221-common.dtsi"
+
+/ {
+	model = "Fujitsu CELVIN Q703";
+	compatible = "fujitsu,q703", "marvell,kirkwood-88f6282",
+		     "marvell,kirkwood";
+
+	gpio-leds {
+		compatible = "gpio-leds";
+		pinctrl-0 = <&pmx_hdd_fault_leds>;
+		pinctrl-names = "default";
+
+		hdd1-fault {
+			label = "q703:red:hdd1-fault";
+			gpios = <&gpio1 14 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		hdd2-fault {
+			label = "q703:red:hdd2-fault";
+			gpios = <&gpio1 15 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+	};
+};
+
+&pcie0 {
+	/* Q703-tested eSATA bridge PERST#. No MPP7 pinctrl hog. */
+	reset-gpios = <&gpio0 7 GPIO_ACTIVE_LOW>;
+};
+
+&pinctrl {
+	pmx_hdd_fault_leds: pmx-hdd-fault-leds {
+		marvell,pins = "mpp46", "mpp47";
+		marvell,function = "gpio";
+	};
+};
+
+&spi0 {
+	m25p128@0 {
+		/* Part observed on Q703; do not assume every TS-221 has it. */
+		compatible = "micron,n25q128a13", "jedec,spi-nor";
+	};
+};

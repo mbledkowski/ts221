@@ -1,0 +1,73 @@
+[workspace]
+name = "ts221"
+requires-pixi = ">=0.79,<0.80"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "==3.13.15"
+git = "*"
+openssl = "*"
+shellcheck = "==0.11.0"
+
+[feature.build.dependencies]
+setuptools = "==80.9.0"
+pyelftools = "==0.32"
+gh = "==2.65.0"
+gcc = "==15.2.0"
+gxx = "==15.2.0"
+conda-gcc-specs = "*"
+binutils = "*"
+bash = "*"
+coreutils = "*"
+diffutils = "*"
+findutils = "*"
+grep = "*"
+sed = "*"
+tar = "*"
+gzip = "*"
+make = "*"
+bc = "*"
+bison = "*"
+flex = "*"
+gawk = "*"
+gettext-tools = "*"
+pkg-config = "*"
+ncurses = "*"
+zlib = "*"
+swig = "*"
+rsync = "*"
+curl = "*"
+wget = "*"
+unzip = "*"
+patch = "*"
+file = "*"
+bzip2 = "*"
+xz = "*"
+zstd = "*"
+perl = "*"
+cmake = "*"
+ninja = "*"
+bubblewrap = "==0.11.2"
+
+[feature.build.activation.env]
+ARM_TOOLCHAIN_URL = "https://www.kernel.org/pub/tools/crosstool/files/bin/x86_64/15.2.0/x86_64-gcc-15.2.0-nolibc-arm-linux-gnueabi.tar.xz"
+ARM_TOOLCHAIN_SHA256 = "1d76128ba6a2e759a2fa1851c72e95ed6a6e86b97ab0adce5660e62fad23b82a"
+ARM_TOOLCHAIN_ARCHIVE = "$PIXI_PROJECT_ROOT/work/gcc-15.2.0.tar.xz"
+ARM_TOOLCHAIN_DIR = "$PIXI_PROJECT_ROOT/work/cross-15.2.0"
+PATH = "$PIXI_PROJECT_ROOT/work/cross-15.2.0/arm-linux-gnueabi/bin:$PATH"
+
+[environments]
+default = { features = ["build"], solve-group = "firmware" }
+check = { features = [], solve-group = "firmware" }
+
+[feature.build.tasks]
+setup = "bash scripts/setup.sh"
+prepare = { cmd = "bash scripts/prepare.sh", depends-on = ["setup"] }
+build = { cmd = "bash scripts/build.sh", depends-on = ["prepare"] }
+release = "python3 scripts/release.py"
+
+[tasks]
+resolve = "python3 scripts/sources.py resolve"
+test = "python3 -m unittest discover -s tests -v"
+lint = "shellcheck -x scripts/build.sh scripts/setup.sh scripts/prepare.sh openwrt/files/usr/sbin/firmware-* openwrt/files/usr/lib/firmware.sh"

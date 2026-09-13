@@ -1,0 +1,95 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+set -eu
+umask 077
+root=${FIRMWARE_ROOT:-}
+# shellcheck source=openwrt/files/usr/lib/firmware.sh
+. "$root/usr/lib/firmware.sh"
+cache=$root/root/updates
+
+# Recovery runs in RAM; only the disk-root image polls automatically.
+awk '$2 == "/" { fs = $3 } END { exit fs != "ext4" }' "$root/proc/mounts" || exit 0
+identify_board
+files="openwrt-$board.tar.gz u-boot-$board.kwb"
+repo=$(cat "$config/repository")
+printf '%s\n' "$repo" | grep -Eq '^[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$'
+mkdir -p "$cache"
+exec 9> "$cache/.lock"
+flock -n 9 || exit 0
+# Boot environment is authoritative; do not update an uninitialized or trial root.
+previous=$("$root/usr/sbin/firmware-install" status) || exit 0
+printf '%s\n' "$previous" | grep -Eq '^(0|[1-9][0-9]{0,9})$'
+stage=$(mktemp -d "$cache/.fetch.XXXXXX")
+trap 'rm -rf "$stage"' EXIT
+trap 'exit 1' HUP INT TERM
+base=https://github.com/$repo/releases
+fetch() {
+	curl --fail --silent --show-error --location --proto '=https' \
+		--proto-redir '=https' --connect-timeout 20 --max-time 1800 \
+		--max-filesize "$3" "$1" -o "$2"
+}
+fetch "$base/latest/download/manifest-$board.json" "$stage/manifest.json" 65536
+fetch "$base/latest/download/manifest-$board.sig" "$stage/manifest.sig" 64
+verify_manifest "$stage"
+
+# Experimental, opt-in bootloader activation: when the installed release is
+# already confirmed (sequence matches the high-water mark) and
+# firmware.nor.auto is enabled, this release's own signed U-Boot is verified,
+# compared against NOR and flashed after a fresh backup on a separately
+# mounted filesystem. See update.md step 5; disabled by default.
+if [ "$sequence" -gt "$previous" ]; then
+	: # OS update first; bootloader activation follows once it is confirmed.
+else
+	# Equal sequence: this release is installed and confirmed, so only the
+	# experimental NOR activation can apply, and the updater is done.
+	command -v uci >/dev/null && [ "$(uci -q get firmware.nor.auto)" = 1 ] || exit 0
+	nor_dir=$(uci -q get firmware.nor.backup_dir || echo /mnt/backup)
+	file_info "u-boot-$board.kwb"
+	fetch "$base/download/$tag/u-boot-$board.kwb" "$stage/u-boot-$board.kwb" "$size"
+	verify_file "u-boot-$board.kwb"
+	bootdev=
+	for entry in "$root"/sys/class/mtd/mtd[0-9]*; do
+		[ -r "$entry/name" ] || continue
+		[ "$(cat "$entry/name")" = U-Boot ] || continue
+		[ "$(cat "$entry/offset")" = 0 ] || continue
+		[ "$(cat "$entry/size")" = 524288 ] || continue
+		bootdev=$root/dev/${entry##*/}
+	done
+	if [ -z "$bootdev" ]; then
+		logger -t firmware 'nor_auto: U-Boot NOR geometry not found; skipping'
+	elif [ "$(head -c "$size" "$bootdev" | sha256sum | cut -d ' ' -f1)" = "$hash" ]; then
+		logger -t firmware 'nor_auto: bootloader already matches this release'
+	elif ! grep -Fq " $nor_dir " "$root/proc/mounts"; then
+		logger -t firmware "nor_auto: bootloader stage kept; $nor_dir is not mounted"
+	else
+		flock -u 9
+		exec 9>&-
+		logger -t firmware "nor_auto: activating release bootloader; NOR backup to $nor_dir"
+		if ! "$root/usr/sbin/firmware-install" u-boot "$stage" "$nor_dir" \
+				--flash-nor > "$cache/nor-auto.log" 2>&1; then
+			logger -t firmware "nor_auto: activation failed; see nor-auto.log in $cache"
+		fi
+		exit 0
+	fi
+	exit 0
+fi
+for name in $files; do
+	file_info "$name"
+	space=$(df -Pk "$cache" | awk 'NR == 2 { print $4 }')
+	if [ "$space" -lt "$(( (size + 1023) / 1024 + 65536 ))" ]; then
+		echo 'Not enough space to stage firmware and leave 64 MiB free' >&2
+		exit 1
+	fi
+	fetch "$base/download/$tag/$name" "$stage/$name" "$size"
+	verify_file "$name"
+done
+# A completed same-tag directory can remain after an interrupted install.
+if [ -e "$cache/$tag" ]; then
+	cmp "$stage/manifest.json" "$cache/$tag/manifest.json"
+	for name in $files; do cmp "$stage/$name" "$cache/$tag/$name"; done
+else
+	mv "$stage" "$cache/$tag"
+fi
+flock -u 9
+exec 9>&-
+"$root/usr/sbin/firmware-install" upgrade "$cache/$tag"

@@ -1,0 +1,11 @@
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+Copyright (C) 2026 Maciej Błędkowski and contributors
+
+Unless a file carries a different SPDX-License-Identifier, original work is
+licensed under GNU AGPL version 3 or any later version:
+https://www.gnu.org/licenses/agpl-3.0.txt
+
+Per-file notices govern imported and differently licensed files, including
+GPL-2.0 device trees and GPL-2.0-or-later U-Boot and on-device code. Downloaded
+upstream sources retain their own licenses and notices.

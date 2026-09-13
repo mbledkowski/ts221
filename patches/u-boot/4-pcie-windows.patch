@@ -1,0 +1,209 @@
+From 0c9fefb2e3ba539f6f97f36403611ecf96b12e95 Mon Sep 17 00:00:00 2001
+From: mbledkowski <pub@mble.dk>
+Date: Mon, 31 Aug 2026 20:52:28 +0200
+Subject: [PATCH 6/6] pci: mvebu: route Kirkwood MBUS windows per port
+
+On Kirkwood, map each enabled PCIe port through its own CPU
+apertures.  Retain the legacy aggregate PCIe windows for boards that
+do not use the DM PCIe driver.
+
+Derive the target and attribute from the existing device tree ranges,
+so port 0 uses the e8/e0 routes and port 1 uses d8/d0.  Keep apertures
+keyed by hardware port rather than enabled-node order.
+
+Signed-off-by: mbledkowski <pub@mble.dk>
+
+diff --git a/arch/arm/mach-kirkwood/cpu.c b/arch/arm/mach-kirkwood/cpu.c
+index a432abe615..0bc7c5fc81 100644
+--- a/arch/arm/mach-kirkwood/cpu.c
++++ b/arch/arm/mach-kirkwood/cpu.c
+@@ -16,6 +16,7 @@
+ #include <asm/io.h>
+ #include <asm/arch/cpu.h>
+ #include <asm/arch/soc.h>
++#include <linux/errno.h>
+ #include <mvebu_mmc.h>
+ 
+ void reset_cpu(void)
+@@ -52,6 +53,8 @@ unsigned int kw_winctrl_calcsize(unsigned int sizeval)
+ }
+ 
+ static const struct mbus_win windows[] = {
++	/* PCI_MVEBU installs per-port windows using the DT target/attribute. */
++#ifndef CONFIG_PCI_MVEBU
+ 	/* Window 0: PCIE MEM address space */
+ 	{ KW_DEFADR_PCI_MEM, KW_DEFADR_PCI_MEM_SIZE,
+ 	  KWCPU_TARGET_PCIE, KWCPU_ATTR_PCIE_MEM },
+@@ -59,6 +62,7 @@ static const struct mbus_win windows[] = {
+ 	/* Window 1: PCIE IO address space */
+ 	{ KW_DEFADR_PCI_IO, KW_DEFADR_PCI_IO_SIZE,
+ 	  KWCPU_TARGET_PCIE, KWCPU_ATTR_PCIE_IO },
++#endif
+ 
+ 	/* Window 2: NAND Flash address space */
+ 	{ KW_DEFADR_NANDF, 1024 * 1024 * 128,
+@@ -77,6 +81,18 @@ static const struct mbus_win windows[] = {
+ 	  KWCPU_TARGET_SASRAM, KWCPU_ATTR_SASRAM },
+ };
+ 
++int kirkwood_pcie_enable_cpu_access(unsigned int port)
++{
++	struct kwcpu_registers *cpureg = (void *)KW_CPU_REG_BASE;
++
++	if (port >= KW_PCIE_MAX_PORTS)
++		return -EINVAL;
++
++	setbits_le32(&cpureg->ctrl_stat, BIT(port * 4));
++
++	return 0;
++}
++
+ /*
+  * SYSRSTn Duration Counter Support
+  *
+@@ -217,12 +233,8 @@ int arch_cpu_init(void)
+ 	writel(reg, (KWGBE_PORT_SERIAL_CONTROL1_REG(1)));
+ #endif
+ #ifdef CONFIG_KIRKWOOD_PCIE_INIT
+-	/*
+-	 * Enable PCI Express Port0
+-	 */
+-	reg = readl(&cpureg->ctrl_stat);
+-	reg |= (1 << 0);	/* Set PEX0En Bit */
+-	writel(reg, &cpureg->ctrl_stat);
++	/* Preserve the pre-driver PCIe0 enable used by older Kirkwood boards. */
++	kirkwood_pcie_enable_cpu_access(0);
+ #endif
+ 	return 0;
+ }
+diff --git a/arch/arm/mach-kirkwood/include/mach/cpu.h b/arch/arm/mach-kirkwood/include/mach/cpu.h
+index 4cdbcae5a7..63a02fec26 100644
+--- a/arch/arm/mach-kirkwood/include/mach/cpu.h
++++ b/arch/arm/mach-kirkwood/include/mach/cpu.h
+@@ -71,6 +71,10 @@ enum kwcpu_attrib {
+ #define KW_DEFADR_PCI_MEM_SIZE	(1024 * 1024 * 256)
+ #define KW_DEFADR_PCI_IO_SIZE	(1024 * 64)
+ 
++#define KW_PCIE_MAX_PORTS	2
++#define KW_PCIE_MEM_SIZE	(1024 * 1024 * 128)
++#define KW_PCIE_IO_SIZE		(1024 * 64)
++
+ struct mbus_win {
+ 	u32 base;
+ 	u32 size;
+@@ -159,6 +163,7 @@ int kw_config_mpp(unsigned int mpp0_7, unsigned int mpp8_15,
+ 		unsigned int mpp32_39, unsigned int mpp40_47,
+ 		unsigned int mpp48_55);
+ unsigned int kw_winctrl_calcsize(unsigned int sizeval);
++int kirkwood_pcie_enable_cpu_access(unsigned int port);
+ int kirkwood_pcie_init(unsigned int port, void __iomem *base,
+ 		       unsigned int *link_wait_retriesp);
+ #endif /* __ASSEMBLY__ */
+diff --git a/arch/arm/mach-kirkwood/pcie.c b/arch/arm/mach-kirkwood/pcie.c
+index dda249ccd0..0e2f4c13db 100644
+--- a/arch/arm/mach-kirkwood/pcie.c
++++ b/arch/arm/mach-kirkwood/pcie.c
+@@ -37,13 +37,12 @@ static void kirkwood_pcie_phy_write(void __iomem *base, u16 reg, u16 value)
+ int kirkwood_pcie_init(unsigned int port, void __iomem *base,
+ 		       unsigned int *link_wait_retriesp)
+ {
+-	struct kwcpu_registers *cpureg = (void *)KW_CPU_REG_BASE;
+ 	u16 device_id, value;
+ 
+ 	if (port > 1)
+ 		return -EINVAL;
+ 
+-	setbits_le32(&cpureg->ctrl_stat, BIT(port * 4));
++	kirkwood_pcie_enable_cpu_access(port);
+ 
+ 	device_id = (readl(KW_REG_PCIE_DEVID) >> 16) & 0xffff;
+ 	if (device_id != KIRKWOOD_DEVICE_ID_88F6282)
+diff --git a/drivers/pci/pci_mvebu.c b/drivers/pci/pci_mvebu.c
+index ac18076822..34faad993c 100644
+--- a/drivers/pci/pci_mvebu.c
++++ b/drivers/pci/pci_mvebu.c
+@@ -510,13 +510,6 @@ static int mvebu_pcie_probe(struct udevice *dev)
+ 	mvebu_pcie_set_local_bus_nr(pcie, 0);
+ 	mvebu_pcie_set_local_dev_nr(pcie, 1);
+ 
+-	/*
+-	 * Kirkwood arch code already maps mbus windows for PCIe IO and MEM.
+-	 * So skip calling mvebu_mbus_add_window_by_id() function as it would
+-	 * fail on error "conflicts with another window" which means conflict
+-	 * with existing PCIe window mappings.
+-	 */
+-#ifndef CONFIG_ARCH_KIRKWOOD
+ 	if (resource_size(&pcie->mem) &&
+ 	    mvebu_mbus_add_window_by_id(pcie->mem_target, pcie->mem_attr,
+ 					(phys_addr_t)pcie->mem.start,
+@@ -538,7 +531,6 @@ static int mvebu_pcie_probe(struct udevice *dev)
+ 		pcie->io.start = 0;
+ 		pcie->io.end = -1;
+ 	}
+-#endif
+ 
+ 	/* Setup windows and configure host bridge */
+ 	mvebu_pcie_setup_wins(pcie);
+@@ -738,8 +730,10 @@ static int mvebu_pcie_bind(struct udevice *parent)
+ 	struct mvebu_pcie *pcie;
+ 	struct uclass_driver *drv;
+ 	struct udevice *dev;
++#ifndef CONFIG_ARCH_KIRKWOOD
+ 	struct resource mem;
+ 	struct resource io;
++#endif
+ 	int ports_count, i;
+ 	ofnode *ports_nodes;
+ 	ofnode subnode;
+@@ -761,12 +755,7 @@ static int mvebu_pcie_bind(struct udevice *parent)
+ 	}
+ 	ports_count = 0;
+ 
+-#ifdef CONFIG_ARCH_KIRKWOOD
+-	mem.start = KW_DEFADR_PCI_MEM;
+-	mem.end = KW_DEFADR_PCI_MEM + KW_DEFADR_PCI_MEM_SIZE - 1;
+-	io.start = KW_DEFADR_PCI_IO;
+-	io.end = KW_DEFADR_PCI_IO + KW_DEFADR_PCI_IO_SIZE - 1;
+-#else
++#ifndef CONFIG_ARCH_KIRKWOOD
+ 	mem.start = MBUS_PCI_MEM_BASE;
+ 	mem.end = MBUS_PCI_MEM_BASE + MBUS_PCI_MEM_SIZE - 1;
+ 	io.start = MBUS_PCI_IO_BASE;
+@@ -787,12 +776,26 @@ static int mvebu_pcie_bind(struct udevice *parent)
+ 			continue;
+ 		}
+ 
++#ifdef CONFIG_ARCH_KIRKWOOD
++		/* Keep each port stable when another DT port is disabled. */
++		if (pcie->lane || pcie->port >= KW_PCIE_MAX_PORTS) {
++			printf("%s: invalid Kirkwood PCIe port\n", pcie->name);
++			free(pcie);
++			continue;
++		}
++
++		pcie->mem.start = KW_DEFADR_PCI_MEM +
++				  pcie->port * KW_PCIE_MEM_SIZE;
++		pcie->mem.end = pcie->mem.start + KW_PCIE_MEM_SIZE - 1;
++		pcie->io.start = KW_DEFADR_PCI_IO +
++				 pcie->port * KW_PCIE_IO_SIZE;
++		pcie->io.end = pcie->io.start + KW_PCIE_IO_SIZE - 1;
++#else
+ 		/*
+ 		 * MVEBU PCIe controller needs MEMORY and I/O BARs to be mapped
+ 		 * into SoCs address space. Each controller will map 128M of MEM
+ 		 * and 64K of I/O space when registered.
+ 		 */
+-
+ 		if (resource_size(&mem) >= SZ_128M) {
+ 			pcie->mem.start = mem.start;
+ 			pcie->mem.end = mem.start + SZ_128M - 1;
+@@ -814,6 +817,7 @@ static int mvebu_pcie_bind(struct udevice *parent)
+ 			pcie->io.start = 0;
+ 			pcie->io.end = -1;
+ 		}
++#endif
+ 
+ 		ports_pcie[ports_count] = pcie;
+ 		ports_nodes[ports_count] = subnode;
+-- 
+2.55.0

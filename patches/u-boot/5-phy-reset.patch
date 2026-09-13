@@ -1,0 +1,41 @@
+diff --git a/board/qnap/ts221/ts221.c b/board/qnap/ts221/ts221.c
+index c417267e79..77c50e09bc 100644
+--- a/board/qnap/ts221/ts221.c
++++ b/board/qnap/ts221/ts221.c
+@@ -9,6 +9,7 @@
+ 
+ #include <init.h>
+ #include <netdev.h>
++#include <phy.h>
+ #include <asm/arch/cpu.h>
+ #include <asm/arch/soc.h>
+ #include <asm/arch/mpp.h>
+@@ -97,6 +98,28 @@ int board_eth_init(struct bd_info *bis)
+ 	return cpu_eth_init(bis);
+ }
+ 
++int board_phy_config(struct phy_device *phydev)
++{
++	int ret;
++
++	/*
++	 * The 88E1318 can retain an enabled-but-stalled autonegotiation state
++	 * across a warm reset. Reset it before applying the normal Marvell
++	 * configuration, then restart autonegotiation unconditionally.
++	 */
++	ret = phy_reset(phydev);
++	if (ret)
++		return ret;
++
++	if (phydev->drv->config) {
++		ret = phydev->drv->config(phydev);
++		if (ret)
++			return ret;
++	}
++
++	return genphy_restart_aneg(phydev);
++}
++
+ int board_init(void)
+ {
+ 	gd->bd->bi_boot_params = mvebu_sdram_bar(0) + 0x100;

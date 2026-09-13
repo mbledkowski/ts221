@@ -1,0 +1,220 @@
+From 0e66bac6bcca351818aca1d7b9e99fb191be9ddb Mon Sep 17 00:00:00 2001
+Date: Mon, 31 Aug 2026 20:33:24 +0200
+Subject: [PATCH 4/6] clk: kirkwood: enable PCIe clocks through driver model
+
+Add a driver for the existing Kirkwood clock-gating binding and make
+the MVEBU PCIe driver enable each port clock before accessing its
+controller registers.
+
+diff --git a/drivers/clk/Kconfig b/drivers/clk/Kconfig
+index c2da7b3938..697c032f7e 100644
+--- a/drivers/clk/Kconfig
++++ b/drivers/clk/Kconfig
+@@ -168,6 +168,13 @@ config CLK_K210_SET_RATE
+ 	  Add functionality to calculate new rates for K210 PLLs. Enabling this
+ 	  feature adds around 1K to U-Boot's final size.
+ 
++config CLK_KIRKWOOD
++	bool "Marvell Kirkwood clock gating support"
++	depends on CLK && ARCH_KIRKWOOD
++	help
++	  Enable the peripheral clock-gating controller found on Marvell
++	  Kirkwood SoCs.
++
+ config CLK_MPC83XX
+ 	bool "Enable MPC83xx clock driver"
+ 	depends on CLK && MPC83xx
+diff --git a/drivers/clk/Makefile b/drivers/clk/Makefile
+index 5f0c0d8a5c..4178a9d13a 100644
+--- a/drivers/clk/Makefile
++++ b/drivers/clk/Makefile
+@@ -38,6 +38,7 @@ obj-$(CONFIG_CLK_CDCE9XX) += clk-cdce9xx.o
+ obj-$(CONFIG_CLK_EXYNOS) += exynos/
+ obj-$(CONFIG_CLK_HSDK) += clk-hsdk-cgu.o
+ obj-$(CONFIG_CLK_K210) += clk_k210.o
++obj-$(CONFIG_CLK_KIRKWOOD) += clk-kirkwood.o
+ obj-$(CONFIG_CLK_MPC83XX) += mpc83xx_clk.o
+ obj-$(CONFIG_CLK_MPFS) += microchip/
+ obj-$(CONFIG_CLK_MVEBU) += mvebu/
+diff --git a/drivers/clk/clk-kirkwood.c b/drivers/clk/clk-kirkwood.c
+new file mode 100644
+index 0000000000..91b243806a
+--- /dev/null
++++ b/drivers/clk/clk-kirkwood.c
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Marvell Kirkwood peripheral clock gates
++ */
++
++#include <clk-uclass.h>
++#include <dm.h>
++#include <asm/io.h>
++#include <linux/bitops.h>
++
++#define KIRKWOOD_CLK_MAX_ID	20
++
++/* DUNIT (bit 6) drives DRAM and must never be gated while U-Boot runs. */
++#define KIRKWOOD_CLK_GATE_MASK	(BIT(0) | BIT(2) | BIT(3) | BIT(4) | \
++				 BIT(5) | BIT(7) | BIT(8) | BIT(9) | \
++				 GENMASK(20, 14))
++
++struct kirkwood_clk_priv {
++	void __iomem *reg;
++};
++
++static int kirkwood_clk_request(struct clk *clk)
++{
++	if (clk->id > KIRKWOOD_CLK_MAX_ID ||
++	    !(KIRKWOOD_CLK_GATE_MASK & BIT(clk->id)))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int kirkwood_clk_enable(struct clk *clk)
++{
++	struct kirkwood_clk_priv *priv = dev_get_priv(clk->dev);
++
++	setbits_le32(priv->reg, BIT(clk->id));
++
++	return 0;
++}
++
++static int kirkwood_clk_disable(struct clk *clk)
++{
++	struct kirkwood_clk_priv *priv = dev_get_priv(clk->dev);
++
++	clrbits_le32(priv->reg, BIT(clk->id));
++
++	return 0;
++}
++
++static const struct clk_ops kirkwood_clk_ops = {
++	.request = kirkwood_clk_request,
++	.enable = kirkwood_clk_enable,
++	.disable = kirkwood_clk_disable,
++};
++
++static int kirkwood_clk_probe(struct udevice *dev)
++{
++	struct kirkwood_clk_priv *priv = dev_get_priv(dev);
++
++	priv->reg = dev_remap_addr(dev);
++	if (!priv->reg)
++		return -EINVAL;
++
++	return 0;
++}
++
++static const struct udevice_id kirkwood_clk_ids[] = {
++	{ .compatible = "marvell,kirkwood-gating-clock" },
++	{ }
++};
++
++U_BOOT_DRIVER(kirkwood_clk) = {
++	.name = "kirkwood_clk",
++	.id = UCLASS_CLK,
++	.of_match = kirkwood_clk_ids,
++	.ops = &kirkwood_clk_ops,
++	.probe = kirkwood_clk_probe,
++	.priv_auto = sizeof(struct kirkwood_clk_priv),
++};
+diff --git a/drivers/pci/Kconfig b/drivers/pci/Kconfig
+index 39df0e776d..a533755b3c 100644
+--- a/drivers/pci/Kconfig
++++ b/drivers/pci/Kconfig
+@@ -344,6 +344,8 @@ config PCIE_IPROC
+ config PCI_MVEBU
+ 	bool "Enable Kirkwood / Armada 370/XP/375/38x PCIe driver"
+ 	depends on (ARCH_KIRKWOOD || ARCH_MVEBU)
++	select CLK if ARCH_KIRKWOOD
++	select CLK_KIRKWOOD if ARCH_KIRKWOOD
+ 	select MISC
+ 	select DM_RESET
+ 	select DM_GPIO
+diff --git a/drivers/pci/pci_mvebu.c b/drivers/pci/pci_mvebu.c
+--- a/drivers/pci/pci_mvebu.c
++++ b/drivers/pci/pci_mvebu.c
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <dm.h>
++#include <clk.h>
+ #include <log.h>
+ #include <malloc.h>
+ #include <dm/device-internal.h>
+@@ -56,6 +57,7 @@
+ 
+ struct mvebu_pcie {
+ 	struct pci_controller hose;
++	struct clk clk;
+ 	void __iomem *base;
+ 	void __iomem *membase;
+ 	struct resource mem;
+@@ -76,6 +78,25 @@
+ 	u32 cfgcache[(0x3c - 0x10) / 4];
+ };
+ 
++static int mvebu_pcie_enable_clock(struct mvebu_pcie *pcie, ofnode node)
++{
++	int ret;
++
++	ret = clk_get_by_index_nodev(node, 0, &pcie->clk);
++	if (ret == -ENOENT)
++		return 0;
++	if (ret) {
++		printf("%s: cannot get clock: %d\n", pcie->name, ret);
++		return ret;
++	}
++
++	ret = clk_enable(&pcie->clk);
++	if (ret)
++		printf("%s: cannot enable clock: %d\n", pcie->name, ret);
++
++	return ret;
++}
++
+ static inline bool mvebu_pcie_link_up(struct mvebu_pcie *pcie)
+ {
+ 	u32 val;
+@@ -420,6 +441,17 @@
+ 	u32 reg;
+ 	int ret;
+ 
++	/*
++	 * Enable the port clock at probe time, not bind time: the clock
++	 * provider can live on a bus that driver model binds after this
++	 * controller's bus, so a bind-time lookup fails with -ENODEV and
++	 * aborts enumeration (observed on Kirkwood, whose gate-clock node
++	 * sits under the ocp bus while this controller sits under mbus).
++	 */
++	ret = mvebu_pcie_enable_clock(pcie, dev_ofnode(dev));
++	if (ret)
++		return ret;
++
+ 	/* Request for optional PERST# GPIO */
+ 	ret = gpio_request_by_name(dev, "reset-gpios", 0, &pcie->reset_gpio, GPIOD_IS_OUT);
+ 	if (ret && ret != -ENOENT) {
+@@ -786,13 +818,18 @@
+ 		ports_count++;
+ 	}
+ 
+-	/* Second phase: Setup all PCIe links (do not enable them yet) */
+-	for (i = 0; i < ports_count; i++)
++	/* Second phase: Setup all PCIe links (do not enable them yet). */
++	for (i = 0; i < ports_count; i++) {
++		if (!ports_pcie[i])
++			continue;
+ 		mvebu_pcie_setup_link(ports_pcie[i]);
++	}
+ 
+-	/* Third phase: Enable all PCIe links and create for each UCLASS_PCI device */
++	/* Third phase: Enable all PCIe links and create each UCLASS_PCI device. */
+ 	for (i = 0; i < ports_count; i++) {
+ 		pcie = ports_pcie[i];
++		if (!pcie)
++			continue;
+ 		subnode = ports_nodes[i];
+ 
+ 		/*
