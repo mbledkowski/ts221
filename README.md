@@ -106,182 +106,6 @@ format checks accept a syntactically valid name, not proof that it is yours.
 - **`sysupgrade`:** OpenWrt's generic upgrade tool. It must **never** be used on
   this disk layout.
 
-## In this repository
-
-### Directory structure
-```
-  final/
-  ├── .github/                               # [CI] GitHub Actions configuration
-  │   └── workflows/
-  │       └── build.yml                      # Runs tests/lint; builds and uploads unsigned candidates on scheduled or manual runs
-  │
-  ├── .gitignore                             # [Git] Excludes work/, dist/, local environments, caches, and agent metadata
-  │
-  ├── .pixi/                                 # [Host] Local Pixi behavior committed with the project
-  │   └── config.toml                        # Stores Pixi environments outside checkout paths that may contain whitespace
-  │
-  ├── LICENSE                                # [Legal] Default AGPL-3.0-or-later license with per-file SPDX exceptions
-  │
-  ├── README.md                              # [Docs] Project overview, host setup, build commands, artifact descriptions, and runbook routing
-  │
-  ├── board/                                 # [Board] Shared hardware definitions and boot contract
-  │   ├── boot.env                           # Persistent U-Boot A/B slots, raw kernel LBAs, boot counters, fallback, and kernel arguments
-  │   ├── kernel.config                      # Boot-critical SATA, RAID, ext4, GPIO, RTC, and power-control kernel options
-  │   ├── q703.dts                           # Fujitsu Q703 device-tree source with HDD LEDs, eSATA reset, and tested SPI-NOR identity
-  │   ├── ts221-common.dtsi                  # Shared 88F6282 platform: RAM, buttons, Ethernet PHY, PCIe, and common peripherals
-  │   └── ts221.dts                          # QNAP TS-221 device-tree wrapper and model identity (no front panel patches, because I do not know if q703 and ts221 have the same front panels)
-  │
-  ├── docs/                                  # [Docs] Operator-facing installation and maintenance runbooks
-  │   ├── install.md                         # Build, preflight, TFTP, UART RAM boot, disk initialization, backup, and NOR activation
-  │   └── update.md                          # Signing, qualification, publication, automatic/manual updates, confirmation, and rollback
-  │
-  ├── keys/                                  # [Trust] Public release identity
-  │   └── release.pub                        # Ed25519 public key embedded in OpenWrt and copied to dist/release.pub
-  │
-  ├── openwrt/                               # [Target] OpenWrt build configuration, rootfs overlay, and hardware package
-  │   ├── config                             # Selects both models, initramfs/rootfs images, storage tools, updater, and board package
-  │   │
-  │   ├── files/                             # Files copied directly into the generated OpenWrt root filesystem
-  │   │   ├── etc/
-  │   │   │   ├── crontabs/
-  │   │   │   │   └── root                   # Runs /usr/sbin/firmware-update daily at 05:23
-  │   │   │   └── mke2fs.conf                # Filesystem defaults used when firmware-install formats system slots
-  │   │   │
-  │   │   └── usr/
-  │   │       ├── lib/
-  │   │       │   └── firmware.sh            # Shared board, manifest-signature, size, repository, sequence, and SHA-256 verification
-  │   │       └── sbin/
-  │   │           ├── firmware-install       # Formats/populates A/B slots, manages boot state, confirms trials, and backs up/flashes NOR
-  │   │           └── firmware-update        # Downloads and verifies signed releases, stages them, and invokes firmware-install
-  │   │
-  │   ├── image.mk                           # Defines Q703/TS-221 images, model-specific DTBs, and the 0x02000000 kernel load address
-  │   │
-  │   └── package/
-  │       └── ts221/                         # Hardware-service package shared by TS-221 and Q703
-  │           ├── Makefile                   # Downloads and patches qcontrol, builds q703-pic, and installs the package files
-  │           │
-  │           ├── files/
-  │           │   ├── defaults               # Configures DHCP, safe RAID mounting, and disabled-by-default automatic NOR activation
-  │           │   ├── q703-leds              # Monitors RAID/SoC health and controls Q703 HDD fault LEDs and thermal fail-safe
-  │           │   ├── qcontrol.conf          # Defines fan control, temperature handling, buttons, and PIC event behavior
-  │           │   └── ts221.init             # Starts qcontrol, boot confirmation, and the Q703-specific LED monitor
-  │           │
-  │           ├── patches/
-  │           │   ├── 1-events.patch         # Makes qcontrol dispatch every PIC event byte received in one read window
-  │           │   └── 2-fan.patch            # Adds LAN/eSATA events, repeated fan commands, and cross-build configuration
-  │           │
-  │           └── src/
-  │               └── q703-pic.c             # Write-only emergency PIC helper used without competing with qcontrol’s PIC reader
-  │
-  ├── patches/                               # [Build] Changes applied to verified upstream source archives
-  │   ├── linux/
-  │   │   └── board.patch                    # Registers both compatible strings and builds the Q703 and TS-221 DTBs
-  │   │
-  │   ├── openwrt/
-  │   │   └── ts221.patch                    # Registers both DTBs in OpenWrt’s Kirkwood kernel build
-  │   │
-  │   └── u-boot/
-  │       ├── 1-board.patch                  # Adds the shared board port, Ethernet support, redundant environment, and A/B boot
-  │       ├── 2-clocks.patch                 # Adds Kirkwood peripheral clock control required by PCIe
-  │       ├── 3-pcie-init.patch              # Restores the 88F6282 PCIe initialization sequence
-  │       ├── 4-pcie-windows.patch           # Configures the correct per-port Kirkwood PCIe memory windows
-  │       └── 5-phy-reset.patch              # Resets and restarts the Ethernet PHY after cold or warm boot
-  │
-  ├── pixi.lock                              # [Host] Exact resolved versions of the host build and check environments
-  │
-  ├── pixi.toml                              # [Host] Linux platform, dependencies, ARM toolchain identity, and public task definitions
-  │
-  ├── scripts/                               # [Host] Source, build, release, and recovery utilities
-  │   ├── build.sh                           # Combines locked sources, board files, patches, OpenWrt files, and the public key into dist/
-  │   ├── prepare.sh                         # Verifies native C/C++, Python headers, U-Boot host tools, and ARMv5 cross-compilation
-  │   ├── recovery_preflight.py              # Validates and freezes the selected U-Boot and recovery-image pair for RAM testing
-  │   ├── release.py                         # Creates/verifies signed manifests and uploads an optional GitHub draft release
-  │   ├── setup.sh                           # Downloads, verifies, and atomically installs the pinned ARM cross-compiler
-  │   ├── sources.py                         # Resolves upstream releases and safely downloads, verifies, caches, and extracts them
-  │   └── tftp_server.py                     # Temporary ACK-aware TFTP server used to transfer recovery.uImage to U-Boot
-  │
-  └── tests/                                 # [Test] Python unittest suite for build, release, recovery, and device behavior
-      ├── test_boot.py                       # Exercises board/boot.env slot selection, disk fallback, bootcount, and rollback logic
-      ├── test_build.py                      # Checks Pixi setup, source refresh, patches, OpenWrt assembly, and output invariants
-      ├── test_guide_flow.py                 # Extracts and tests executable shell blocks from install.md and update.md
-      ├── test_install.py                    # Simulates initialization, inactive-slot updates, confirmation, backup, and NOR safeguards
-      ├── test_recovery_preflight.py         # Tests U-Boot limits and immutable recovery-session staging
-      ├── test_release.py                    # Tests manifest contents, signatures, asset consistency, and draft publication
-      ├── test_sources.py                    # Tests source resolution, HTTPS enforcement, hashes, caching, and safe extraction
-      ├── test_tftp_server.py                # Tests TFTP requests, ACK handling, retries, cancellation, and path confinement
-      └── test_update.py                     # Simulates downloads, signature failures, replay protection, staging, and optional NOR updates
-```
-
-### Chart representing the architecture
-
-```mermaid
-   flowchart TD
-        %% Subsystem 1: Repository Inputs
-        subgraph S_INPUTS["1. Repository Source Inputs"]
-            direction TB
-            IN_BOARD["board/<br/>• boot.env (A/B slots & LBAs)<br/>• kernel.config (Built-in SATA/RAID)<br/>• DTS & DTSI (TS-221 / Q703)"]
-            IN_PATCH["patches/<br/>• u-boot/ (PCIe, clocks, PHY reset)<br/>• linux/ & openwrt/ (DTB hooks)"]
-            IN_OWRT["openwrt/<br/>• config & image.mk<br/>• files/ (overlay & firmware tools)<br/>• package/ts221/ (qcontrol & LEDs)"]
-            IN_KEY["keys/release.pub<br/>• Root trust anchor"]
-            IN_UPSTREAM["Upstream Sources<br/>• Locked by scripts/sources.py"]
-        end
-
-        %% Subsystem 2: Host Build Orchestration
-        subgraph S_BUILD["2. Host Build System (Pixi)"]
-            direction TB
-            B_SETUP["scripts/setup.sh & prepare.sh<br/>• Pinned ARM toolchain verification"]
-            B_RUN["scripts/build.sh<br/>(invoked via pixi run build)"]
-            W_DIR["work/<br/>(Unversioned build cache & toolchain)"]
-
-            B_SETUP --> B_RUN
-            B_RUN <--> W_DIR
-        end
-
-        %% Subsystem 3: Generated Artifacts
-        subgraph S_DIST["3. Release Candidates (dist/)"]
-            direction TB
-            D_UB["u-boot-q703.kwb<br/>u-boot-ts221.kwb"]
-            D_OW["openwrt-q703.tar.gz<br/>openwrt-ts221.tar.gz<br/>(kernel + recovery + rootfs)"]
-            D_LX["linux.tar.gz<br/>(Mainline validation build)"]
-            D_META["sources.json & release.pub"]
-        end
-
-        %% Subsystem 4: Qualification & Signing
-        subgraph S_QUAL["4. Release Signing (scripts/release.py)"]
-            direction TB
-            Q_KEY["External Private Key<br/>(Kept outside repository, mode 0600)"]
-            Q_TOOL["pixi run release sign &lt;tag&gt;"]
-            Q_SIG["Signed Artifacts:<br/>• manifest-{model}.json<br/>• manifest-{model}.sig"]
-
-            Q_KEY --> Q_TOOL
-            Q_TOOL --> Q_SIG
-        end
-
-        %% Subsystem 5: Target Device Deployment
-        subgraph S_TARGET["5. Target NAS Deployment & Runtime"]
-            direction TB
-            T_RAM["RAM Recovery Test (Non-destructive)<br/>• scripts/recovery_preflight.py<br/>• scripts/tftp_server.py (UDP :69)<br/>• kwboot over 3.3V
-  UART"]
-
-            T_INSTALL["Permanent Installation (firmware-install)<br/>• 16 MiB SPI NOR: Modern U-Boot<br/>• RootFS2: Redundant boot.env<br/>• Dual SATA
-  Disks: md0 (Slot A) / md1 (Slot B)"]
-
-            T_RUNTIME["Runtime Services & Updates<br/>• qcontrol & q703-leds (Fan, LEDs, PIC)<br/>• firmware-update (Daily cron check)"]
-        end
-
-        %% Wiring connections
-        IN_BOARD & IN_PATCH & IN_OWRT & IN_KEY & IN_UPSTREAM --> B_RUN
-        B_RUN --> D_UB & D_OW & D_LX & D_META
-
-        %% To Qualification and RAM Testing
-        D_UB & D_OW --> T_RAM
-        D_UB & D_OW & D_LX & D_META --> Q_TOOL
-
-        %% To Permanent Target
-        Q_SIG & D_UB & D_OW --> T_INSTALL
-        T_INSTALL --> T_RUNTIME
-```
-
 ## Build
 
 These build instructions are for maintainers and developers. For a first
@@ -489,6 +313,181 @@ the update guide. NOR has no A/B fallback.
 | `docs/` | [Installation](docs/install.md) and [update](docs/update.md) guides |
 | `keys/` | Public release keys (`release.pub` committed as root trust anchor) |
 | `work/`, `dist/` | Generated sources and outputs, ignored by Git |
+
+### Directory structure
+```
+  final/
+  ├── .github/                               # [CI] GitHub Actions configuration
+  │   └── workflows/
+  │       └── build.yml                      # Runs tests/lint; builds and uploads unsigned candidates on scheduled or manual runs
+  │
+  ├── .gitignore                             # [Git] Excludes work/, dist/, local environments, caches, and agent metadata
+  │
+  ├── .pixi/                                 # [Host] Local Pixi behavior committed with the project
+  │   └── config.toml                        # Stores Pixi environments outside checkout paths that may contain whitespace
+  │
+  ├── LICENSE                                # [Legal] Default AGPL-3.0-or-later license with per-file SPDX exceptions
+  │
+  ├── README.md                              # [Docs] Project overview, host setup, build commands, artifact descriptions, and runbook routing
+  │
+  ├── board/                                 # [Board] Shared hardware definitions and boot contract
+  │   ├── boot.env                           # Persistent U-Boot A/B slots, raw kernel LBAs, boot counters, fallback, and kernel arguments
+  │   ├── kernel.config                      # Boot-critical SATA, RAID, ext4, GPIO, RTC, and power-control kernel options
+  │   ├── q703.dts                           # Fujitsu Q703 device-tree source with HDD LEDs, eSATA reset, and tested SPI-NOR identity
+  │   ├── ts221-common.dtsi                  # Shared 88F6282 platform: RAM, buttons, Ethernet PHY, PCIe, and common peripherals
+  │   └── ts221.dts                          # QNAP TS-221 device-tree wrapper and model identity (no front panel patches, because I do not know if q703 and ts221 have the same front panels)
+  │
+  ├── docs/                                  # [Docs] Operator-facing installation and maintenance runbooks
+  │   ├── install.md                         # Build, preflight, TFTP, UART RAM boot, disk initialization, backup, and NOR activation
+  │   └── update.md                          # Signing, qualification, publication, automatic/manual updates, confirmation, and rollback
+  │
+  ├── keys/                                  # [Trust] Public release identity
+  │   └── release.pub                        # Ed25519 public key embedded in OpenWrt and copied to dist/release.pub
+  │
+  ├── openwrt/                               # [Target] OpenWrt build configuration, rootfs overlay, and hardware package
+  │   ├── config                             # Selects both models, initramfs/rootfs images, storage tools, updater, and board package
+  │   │
+  │   ├── files/                             # Files copied directly into the generated OpenWrt root filesystem
+  │   │   ├── etc/
+  │   │   │   ├── crontabs/
+  │   │   │   │   └── root                   # Runs /usr/sbin/firmware-update daily at 05:23
+  │   │   │   └── mke2fs.conf                # Filesystem defaults used when firmware-install formats system slots
+  │   │   │
+  │   │   └── usr/
+  │   │       ├── lib/
+  │   │       │   └── firmware.sh            # Shared board, manifest-signature, size, repository, sequence, and SHA-256 verification
+  │   │       └── sbin/
+  │   │           ├── firmware-install       # Formats/populates A/B slots, manages boot state, confirms trials, and backs up/flashes NOR
+  │   │           └── firmware-update        # Downloads and verifies signed releases, stages them, and invokes firmware-install
+  │   │
+  │   ├── image.mk                           # Defines Q703/TS-221 images, model-specific DTBs, and the 0x02000000 kernel load address
+  │   │
+  │   └── package/
+  │       └── ts221/                         # Hardware-service package shared by TS-221 and Q703
+  │           ├── Makefile                   # Downloads and patches qcontrol, builds q703-pic, and installs the package files
+  │           │
+  │           ├── files/
+  │           │   ├── defaults               # Configures DHCP, safe RAID mounting, and disabled-by-default automatic NOR activation
+  │           │   ├── q703-leds              # Monitors RAID/SoC health and controls Q703 HDD fault LEDs and thermal fail-safe
+  │           │   ├── qcontrol.conf          # Defines fan control, temperature handling, buttons, and PIC event behavior
+  │           │   └── ts221.init             # Starts qcontrol, boot confirmation, and the Q703-specific LED monitor
+  │           │
+  │           ├── patches/
+  │           │   ├── 1-events.patch         # Makes qcontrol dispatch every PIC event byte received in one read window
+  │           │   └── 2-fan.patch            # Adds LAN/eSATA events, repeated fan commands, and cross-build configuration
+  │           │
+  │           └── src/
+  │               └── q703-pic.c             # Write-only emergency PIC helper used without competing with qcontrol’s PIC reader
+  │
+  ├── patches/                               # [Build] Changes applied to verified upstream source archives
+  │   ├── linux/
+  │   │   └── board.patch                    # Registers both compatible strings and builds the Q703 and TS-221 DTBs
+  │   │
+  │   ├── openwrt/
+  │   │   └── ts221.patch                    # Registers both DTBs in OpenWrt’s Kirkwood kernel build
+  │   │
+  │   └── u-boot/
+  │       ├── 1-board.patch                  # Adds the shared board port, Ethernet support, redundant environment, and A/B boot
+  │       ├── 2-clocks.patch                 # Adds Kirkwood peripheral clock control required by PCIe
+  │       ├── 3-pcie-init.patch              # Restores the 88F6282 PCIe initialization sequence
+  │       ├── 4-pcie-windows.patch           # Configures the correct per-port Kirkwood PCIe memory windows
+  │       └── 5-phy-reset.patch              # Resets and restarts the Ethernet PHY after cold or warm boot
+  │
+  ├── pixi.lock                              # [Host] Exact resolved versions of the host build and check environments
+  │
+  ├── pixi.toml                              # [Host] Linux platform, dependencies, ARM toolchain identity, and public task definitions
+  │
+  ├── scripts/                               # [Host] Source, build, release, and recovery utilities
+  │   ├── build.sh                           # Combines locked sources, board files, patches, OpenWrt files, and the public key into dist/
+  │   ├── prepare.sh                         # Verifies native C/C++, Python headers, U-Boot host tools, and ARMv5 cross-compilation
+  │   ├── recovery_preflight.py              # Validates and freezes the selected U-Boot and recovery-image pair for RAM testing
+  │   ├── release.py                         # Creates/verifies signed manifests and uploads an optional GitHub draft release
+  │   ├── setup.sh                           # Downloads, verifies, and atomically installs the pinned ARM cross-compiler
+  │   ├── sources.py                         # Resolves upstream releases and safely downloads, verifies, caches, and extracts them
+  │   └── tftp_server.py                     # Temporary ACK-aware TFTP server used to transfer recovery.uImage to U-Boot
+  │
+  └── tests/                                 # [Test] Python unittest suite for build, release, recovery, and device behavior
+      ├── test_boot.py                       # Exercises board/boot.env slot selection, disk fallback, bootcount, and rollback logic
+      ├── test_build.py                      # Checks Pixi setup, source refresh, patches, OpenWrt assembly, and output invariants
+      ├── test_guide_flow.py                 # Extracts and tests executable shell blocks from install.md and update.md
+      ├── test_install.py                    # Simulates initialization, inactive-slot updates, confirmation, backup, and NOR safeguards
+      ├── test_recovery_preflight.py         # Tests U-Boot limits and immutable recovery-session staging
+      ├── test_release.py                    # Tests manifest contents, signatures, asset consistency, and draft publication
+      ├── test_sources.py                    # Tests source resolution, HTTPS enforcement, hashes, caching, and safe extraction
+      ├── test_tftp_server.py                # Tests TFTP requests, ACK handling, retries, cancellation, and path confinement
+      └── test_update.py                     # Simulates downloads, signature failures, replay protection, staging, and optional NOR updates
+```
+
+### Chart representing the architecture
+
+```mermaid
+   flowchart TD
+        %% Subsystem 1: Repository Inputs
+        subgraph S_INPUTS["1. Repository Source Inputs"]
+            direction TB
+            IN_BOARD["board/<br/>• boot.env (A/B slots & LBAs)<br/>• kernel.config (Built-in SATA/RAID)<br/>• DTS & DTSI (TS-221 / Q703)"]
+            IN_PATCH["patches/<br/>• u-boot/ (PCIe, clocks, PHY reset)<br/>• linux/ & openwrt/ (DTB hooks)"]
+            IN_OWRT["openwrt/<br/>• config & image.mk<br/>• files/ (overlay & firmware tools)<br/>• package/ts221/ (qcontrol & LEDs)"]
+            IN_KEY["keys/release.pub<br/>• Root trust anchor"]
+            IN_UPSTREAM["Upstream Sources<br/>• Locked by scripts/sources.py"]
+        end
+
+        %% Subsystem 2: Host Build Orchestration
+        subgraph S_BUILD["2. Host Build System (Pixi)"]
+            direction TB
+            B_SETUP["scripts/setup.sh & prepare.sh<br/>• Pinned ARM toolchain verification"]
+            B_RUN["scripts/build.sh<br/>(invoked via pixi run build)"]
+            W_DIR["work/<br/>(Unversioned build cache & toolchain)"]
+
+            B_SETUP --> B_RUN
+            B_RUN <--> W_DIR
+        end
+
+        %% Subsystem 3: Generated Artifacts
+        subgraph S_DIST["3. Release Candidates (dist/)"]
+            direction TB
+            D_UB["u-boot-q703.kwb<br/>u-boot-ts221.kwb"]
+            D_OW["openwrt-q703.tar.gz<br/>openwrt-ts221.tar.gz<br/>(kernel + recovery + rootfs)"]
+            D_LX["linux.tar.gz<br/>(Mainline validation build)"]
+            D_META["sources.json & release.pub"]
+        end
+
+        %% Subsystem 4: Qualification & Signing
+        subgraph S_QUAL["4. Release Signing (scripts/release.py)"]
+            direction TB
+            Q_KEY["External Private Key<br/>(Kept outside repository, mode 0600)"]
+            Q_TOOL["pixi run release sign &lt;tag&gt;"]
+            Q_SIG["Signed Artifacts:<br/>• manifest-{model}.json<br/>• manifest-{model}.sig"]
+
+            Q_KEY --> Q_TOOL
+            Q_TOOL --> Q_SIG
+        end
+
+        %% Subsystem 5: Target Device Deployment
+        subgraph S_TARGET["5. Target NAS Deployment & Runtime"]
+            direction TB
+            T_RAM["RAM Recovery Test (Non-destructive)<br/>• scripts/recovery_preflight.py<br/>• scripts/tftp_server.py (UDP :69)<br/>• kwboot over 3.3V
+  UART"]
+
+            T_INSTALL["Permanent Installation (firmware-install)<br/>• 16 MiB SPI NOR: Modern U-Boot<br/>• RootFS2: Redundant boot.env<br/>• Dual SATA
+  Disks: md0 (Slot A) / md1 (Slot B)"]
+
+            T_RUNTIME["Runtime Services & Updates<br/>• qcontrol & q703-leds (Fan, LEDs, PIC)<br/>• firmware-update (Daily cron check)"]
+        end
+
+        %% Wiring connections
+        IN_BOARD & IN_PATCH & IN_OWRT & IN_KEY & IN_UPSTREAM --> B_RUN
+        B_RUN --> D_UB & D_OW & D_LX & D_META
+
+        %% To Qualification and RAM Testing
+        D_UB & D_OW --> T_RAM
+        D_UB & D_OW & D_LX & D_META --> Q_TOOL
+
+        %% To Permanent Target
+        Q_SIG & D_UB & D_OW --> T_INSTALL
+        T_INSTALL --> T_RUNTIME
+```
+
 
 ### Automated builds
 
