@@ -306,7 +306,9 @@ prepare_openwrt_source() {
 }
 
 configure_openwrt() {
-	(cd "$src"; ./scripts/feeds update -a; ./scripts/feeds install -a; make defconfig)
+	(cd "$src"; ./scripts/feeds update -a; ./scripts/feeds install -a
+		cp "$root/openwrt/config" .config
+		make defconfig)
 }
 
 validate_openwrt_config() {
@@ -335,6 +337,16 @@ validate_openwrt_outputs() {
 			return 1
 		fi
 	done
+}
+
+run_openwrt_make() {
+	local -a make_options=("$@")
+
+	if make -C "$src" -j"$jobs" "${make_options[@]}"; then
+		return 0
+	fi
+	echo 'Parallel OpenWrt build failed; retrying serially with verbose output.' >&2
+	make -C "$src" -j1 V=s "${make_options[@]}"
 }
 
 package_openwrt() {
@@ -382,9 +394,9 @@ build_openwrt() (
 		namespace_fakeroot="bwrap --die-with-parent --unshare-user "
 		namespace_fakeroot+="--uid 0 --gid 0 --dev-bind / / -- "
 		namespace_fakeroot+="$src/staging_dir/host/bin/fakeroot"
-		make -C "$src" -j"$jobs" FAKEROOT="$namespace_fakeroot"
+		run_openwrt_make "FAKEROOT=$namespace_fakeroot"
 	else
-		make -C "$src" -j"$jobs"
+		run_openwrt_make
 	fi
 	package_openwrt
 	printf 'Built dist/openwrt-q703.tar.gz and dist/openwrt-ts221.tar.gz\n'

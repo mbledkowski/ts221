@@ -204,14 +204,26 @@ class BuildTests(unittest.TestCase):
         (self.source / ".q703-build-root").write_text(str(effective_root) + "\n")
         scripts = self.source / "scripts"
         scripts.mkdir()
-        (scripts / "feeds").write_text("#!/bin/sh\nexit 0\n")
+        (scripts / "feeds").write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = update ]; then\n"
+            "  sed -i '/^CONFIG_PACKAGE_curl=y$/d' .config\n"
+            "fi\n"
+        )
         (scripts / "feeds").chmod(0o755)
         fakebin = self.root / "bin"
         fakebin.mkdir()
         calls = self.root / "make.calls"
+        first_parallel_failure = self.root / "make.first-parallel-failure"
         (fakebin / "make").write_text(
             f'#!/bin/sh\nprintf "%s|%s|%s|%s|%s\\n" "${{CC-unset}}" '
-            f'"${{CROSS_COMPILE-unset}}" "${{ARCH-unset}}" "$PWD" "$*" >> "{calls}"\n')
+            f'"${{CROSS_COMPILE-unset}}" "${{ARCH-unset}}" "$PWD" "$*" >> "{calls}"\n'
+            "if [ \"$*\" = defconfig ]; then\n"
+            "  grep -qxF 'CONFIG_PACKAGE_curl=y' .config || exit 1\n"
+            "fi\n"
+            f'case "$*" in *-j2*) if [ ! -e "{first_parallel_failure}" ]; then '
+            f': > "{first_parallel_failure}"; exit 2; fi ;; esac\n'
+        )
         (fakebin / "make").chmod(0o755)
         self.env["PATH"] = f"{fakebin}:{self.env['PATH']}"
         self.env.update({"CC": "host-cc", "CROSS_COMPILE": "host-cross-", "ARCH": "host"})
@@ -238,8 +250,10 @@ class BuildTests(unittest.TestCase):
         for model, device in (("q703", "fujitsu_q703"), ("ts221", "qnap_ts221")):
             (image_dir / f"{device}-uImage").write_bytes(f"kernel {model}".encode())
 
+        build_results = []
         for _ in range(2):
             result = self.build()
+            build_results.append(result)
             self.assertEqual(result.returncode, 0, result.stderr)
 
         fields = ("cc", "cross_compile", "arch", "pwd", "arguments")
@@ -247,7 +261,7 @@ class BuildTests(unittest.TestCase):
             dict(zip(fields, line.split("|", 4)))
             for line in calls.read_text().splitlines()
         ]
-        self.assertEqual(len(records), 4)
+        self.assertEqual(len(records), 5)
         for record in records:
             self.assertEqual(
                 (record["cc"], record["cross_compile"], record["arch"]),
@@ -257,7 +271,7 @@ class BuildTests(unittest.TestCase):
         defconfigs = [record for record in records if record["arguments"] == "defconfig"]
         builds = [record for record in records if record["arguments"].startswith("-C ")]
         self.assertEqual(len(defconfigs), 2)
-        self.assertEqual(len(builds), 2)
+        self.assertEqual(len(builds), 3)
         self.assertEqual(len(defconfigs) + len(builds), len(records))
         effective_roots = {record["pwd"] for record in builds}
         self.assertEqual(len(effective_roots), 1)
@@ -265,12 +279,15 @@ class BuildTests(unittest.TestCase):
         self.assertFalse(any(character.isspace() for character in effective_root))
         for record in defconfigs:
             self.assertEqual(record["pwd"], f"{effective_root}/work/openwrt")
-        for record in builds:
+        for index, record in enumerate(builds):
             arguments = record["arguments"].split()
             self.assertEqual(arguments[0], "-C")
-            self.assertEqual(arguments[2], "-j2")
             self.assertEqual(arguments[1], f"{effective_root}/work/openwrt")
             self.assertFalse(any(character.isspace() for character in arguments[1]))
+            if index == 1:
+                self.assertEqual(arguments[2:4], ["-j1", "V=s"])
+            else:
+                self.assertEqual(arguments[2], "-j2")
             if self.namespace_mode:
                 self.assertIn("FAKEROOT=bwrap", record["arguments"])
                 self.assertIn("--unshare-user --uid 0 --gid 0", record["arguments"])
@@ -278,7 +295,12 @@ class BuildTests(unittest.TestCase):
                     f"{effective_root}/work/openwrt/staging_dir/host/bin/fakeroot"
                 ))
             else:
-                self.assertEqual(len(arguments), 3)
+                self.assertEqual(len(arguments), 4 if index == 1 else 3)
+
+        self.assertIn(
+            "Parallel OpenWrt build failed; retrying serially with verbose output.",
+            build_results[0].stderr,
+        )
 
         if self.namespace_mode:
             message_prefix = "Checkout path contains whitespace; building through "
